@@ -32,6 +32,12 @@ dst = datasets.CIFAR100("~/.torch", download=True)
 tp = transforms.ToTensor()
 tt = transforms.ToPILImage()
 
+def to_safe_pil(img_tensor):
+    """Convert tensor to PIL image, sanitizing NaNs/Infs and clamping to [0, 1]."""
+    img_tensor = torch.nan_to_num(img_tensor.detach().cpu(), nan=0.0, posinf=1.0, neginf=0.0)
+    img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
+    return tt(img_tensor)
+
 img_index = args.index
 gt_data = tp(dst[img_index][0]).to(device)
 
@@ -45,7 +51,7 @@ gt_label = torch.Tensor([dst[img_index][1]]).long().to(device)
 gt_label = gt_label.view(1, )
 gt_onehot_label = label_to_onehot(gt_label)
 
-plt.imshow(tt(gt_data[0].cpu()))
+plt.imshow(to_safe_pil(gt_data[0]))
 
 from models.vision import LeNet, weights_init
 net = LeNet().to(device)
@@ -67,7 +73,7 @@ original_dy_dx = list((_.detach().clone() for _ in dy_dx))
 dummy_data = torch.randn(gt_data.size()).to(device).requires_grad_(True)
 dummy_label = torch.randn(gt_onehot_label.size()).to(device).requires_grad_(True)
 
-plt.imshow(tt(dummy_data[0].cpu()))
+plt.imshow(to_safe_pil(dummy_data[0]))
 
 optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
 
@@ -93,7 +99,7 @@ for iters in range(300):
     if iters % 10 == 0: 
         current_loss = closure()
         print(iters, "%.4f" % current_loss.item())
-        history.append(tt(dummy_data[0].cpu()))
+        history.append(to_safe_pil(dummy_data[0]))
 
 plt.figure(figsize=(12, 8))
 for i in range(30):
