@@ -25,6 +25,13 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=300, help="LBFGS steps for reconstruction.")
     parser.add_argument("--log-every", type=int, default=25, help="Store intermediate reconstructions every N steps.")
     parser.add_argument("--restarts", type=int, default=1, help="Number of random restarts for inversion (best loss kept).")
+    parser.add_argument("--tv-weight", type=float, default=0.0, help="Total variation weight to encourage smooth reconstructions.")
+    parser.add_argument(
+        "--init-scale",
+        type=float,
+        default=1.0,
+        help="Stddev multiplier for dummy data init (smaller can help aggregated inversion).",
+    )
     parser.add_argument(
         "--dummy-seed",
         type=int,
@@ -36,6 +43,22 @@ def parse_args():
         choices=["aggregated", "per-client", "both"],
         default="per-client",
         help="Reconstruct from aggregated gradients, per-client gradients, or both.",
+    )
+    parser.add_argument(
+        "--normalize-gradients",
+        action="store_true",
+        help="L2-normalize client gradients before aggregation to reduce dominance.",
+    )
+    parser.add_argument(
+        "--apply-agg-step",
+        action="store_true",
+        help="Apply one gradient descent step on the server model using the aggregated gradients before inversion.",
+    )
+    parser.add_argument(
+        "--agg-lr",
+        type=float,
+        default=0.1,
+        help="Learning rate for the aggregated gradient step when --apply-agg-step is set.",
     )
     parser.add_argument(
         "--client-indices",
@@ -187,6 +210,8 @@ def main():
                 log_every=args.log_every,
                 restarts=args.restarts,
                 init_seed=args.dummy_seed + client.client_id if args.dummy_seed is not None else None,
+                tv_weight=args.tv_weight,
+                init_scale=args.init_scale,
             )
             per_client_results.append(
                 {
@@ -200,8 +225,13 @@ def main():
 
     aggregated_result = None
     if args.reconstruct_mode in ("aggregated", "both"):
-        aggregated_gradients = server.aggregate_gradients(client_gradients)
-        print("Aggregated gradients collected from clients.")
+        aggregated_gradients = server.aggregate_gradients(client_gradients, normalize=args.normalize_gradients)
+        print(f"Aggregated gradients collected from clients. normalize_gradients={args.normalize_gradients}")
+
+        if args.apply_agg_step:
+            print(f"Applying aggregated gradient step to server model with lr={args.agg_lr}")
+            server.apply_gradient_step(aggregated_gradients, lr=args.agg_lr)
+
         data_shape = torch.Size((total_samples, *clients[0].data.shape[1:]))
         recovered_data, recovered_labels, history = server.reconstruct_data(
             aggregated_gradients,
@@ -210,6 +240,8 @@ def main():
             log_every=args.log_every,
             restarts=args.restarts,
             init_seed=args.dummy_seed,
+            tv_weight=args.tv_weight,
+            init_scale=args.init_scale,
         )
         aggregated_result = {"recovered_data": recovered_data, "history": history, "recovered_labels": recovered_labels}
         print("Aggregated reconstruction complete.")

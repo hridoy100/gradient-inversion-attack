@@ -33,11 +33,22 @@ class FederatedServer:
         self.device = device
         self.num_classes = num_classes
 
-    def aggregate_gradients(self, client_gradients: List[List[torch.Tensor]]) -> List[torch.Tensor]:
-        """Average gradients across clients, keeping shape/ordering aligned with model params."""
+    def aggregate_gradients(self, client_gradients: List[List[torch.Tensor]], normalize: bool = False) -> List[torch.Tensor]:
+        """Average gradients across clients, keeping shape/ordering aligned with model params.
+
+        If normalize is True, each client's gradient tensor is L2-normalized before averaging to
+        reduce domination from any single client with a larger loss/scale.
+        """
         aggregated = []
         for grads_for_param in zip(*client_gradients):
-            grads_on_device = [g.to(self.device) for g in grads_for_param]
+            grads_on_device = []
+            for g in grads_for_param:
+                g = g.to(self.device)
+                if normalize:
+                    norm = torch.norm(g)
+                    if norm > 0:
+                        g = g / norm
+                grads_on_device.append(g)
             aggregated.append(torch.stack(grads_on_device, dim=0).mean(dim=0))
         return aggregated
 
@@ -49,6 +60,8 @@ class FederatedServer:
         log_every: int = 20,
         restarts: int = 1,
         init_seed: int = None,
+        tv_weight: float = 0.0,
+        init_scale: float = 1.0,
     ):
         """Reconstruct training data that matches the provided gradients."""
         return gradient_inversion(
@@ -61,7 +74,15 @@ class FederatedServer:
             log_every=log_every,
             restarts=restarts,
             init_seed=init_seed,
+            tv_weight=tv_weight,
+            init_scale=init_scale,
         )
+
+    def apply_gradient_step(self, gradients: List[torch.Tensor], lr: float = 0.1):
+        """Apply a single gradient descent step on the server model using aggregated gradients."""
+        with torch.no_grad():
+            for p, g in zip(self.model.parameters(), gradients):
+                p.add_( -lr * g.to(self.device))
 
 
 def gradient_inversion(
@@ -74,6 +95,8 @@ def gradient_inversion(
     log_every: int = 20,
     restarts: int = 1,
     init_seed: int = None,
+    tv_weight: float = 0.0,
+    init_scale: float = 1.0,
 ):
     """Run gradient matching to recover training data from shared gradients."""
     best = {"loss": float("inf"), "data": None, "labels": None, "history": None}
@@ -82,7 +105,7 @@ def gradient_inversion(
         if init_seed is not None:
             torch.manual_seed(init_seed + attempt)
 
-        dummy_data = torch.randn(data_shape, device=device, requires_grad=True)
+        dummy_data = (torch.randn(data_shape, device=device) * init_scale).requires_grad_(True)
         dummy_label = torch.randn((data_shape[0], num_classes), device=device, requires_grad=True)
         optimizer = torch.optim.LBFGS([dummy_data, dummy_label])
 
@@ -95,6 +118,12 @@ def gradient_inversion(
             dummy_loss = cross_entropy_for_onehot(pred, dummy_onehot)
             dummy_dy_dx = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
             grad_diff = sum(((gx - gy) ** 2).sum() for gx, gy in zip(dummy_dy_dx, target_gradients))
+
+            if tv_weight > 0:
+                tv_h = torch.abs(dummy_data[:, :, :, :-1] - dummy_data[:, :, :, 1:]).mean()
+                tv_v = torch.abs(dummy_data[:, :, :-1, :] - dummy_data[:, :, 1:, :]).mean()
+                tv = tv_h + tv_v
+                grad_diff = grad_diff + tv_weight * tv
             return grad_diff
 
         last_loss_val = None
