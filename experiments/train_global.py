@@ -14,32 +14,59 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, models
 
 from models.vision import LeNet, weights_init
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a global LeNet on CIFAR100 and save a checkpoint.")
-    parser.add_argument("--epochs", type=int, default=1, help="Training epochs.")
+    parser = argparse.ArgumentParser(description="Train a global model on CIFAR100 and save a checkpoint.")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size.")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate.")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum.")
+    parser.add_argument("--weight-decay", type=float, default=5e-4, help="Weight decay.")
+    parser.add_argument("--step-size", type=int, default=20, help="StepLR step size.")
+    parser.add_argument("--gamma", type=float, default=0.1, help="StepLR gamma.")
     parser.add_argument("--data-root", type=str, default="~/.torch", help="Dataset root for CIFAR100.")
     parser.add_argument("--output", type=str, default="checkpoints/global.pth", help="Path to save state_dict.")
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default="lenet",
+        choices=["lenet", "resnet18"],
+        help="Model architecture to train.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    transform = transforms.ToTensor()
+    normalize = transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761])
+    transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
     train_set = datasets.CIFAR100(args.data_root, train=True, download=True, transform=transform)
     loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
-    model = LeNet().to(device)
-    model.apply(weights_init)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+    if args.arch == "lenet":
+        model = LeNet().to(device)
+        model.apply(weights_init)
+    elif args.arch == "resnet18":
+        model = models.resnet18(num_classes=100).to(device)
+    else:
+        raise ValueError(f"Unsupported architecture: {args.arch}")
+
+    optimizer = optim.SGD(
+        model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
+    )
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
 
     model.train()
     for epoch in range(args.epochs):
@@ -53,7 +80,10 @@ def main():
             optimizer.step()
             total_loss += loss.item() * data.size(0)
         avg_loss = total_loss / len(train_set)
-        print(f"Epoch {epoch+1}/{args.epochs} - loss: {avg_loss:.4f}")
+        scheduler.step()
+        print(
+            f"Epoch {epoch+1}/{args.epochs} - loss: {avg_loss:.4f} - lr: {scheduler.get_last_lr()[0]:.5f}"
+        )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
