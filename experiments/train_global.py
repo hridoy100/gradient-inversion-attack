@@ -31,6 +31,11 @@ def parse_args():
     parser.add_argument("--data-root", type=str, default="~/.torch", help="Dataset root for CIFAR100.")
     parser.add_argument("--output", type=str, default="checkpoints/global.pth", help="Path to save state_dict.")
     parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Use GPU if available; raises if requested but CUDA is not available.",
+    )
+    parser.add_argument(
         "--arch",
         type=str,
         default="lenet",
@@ -42,7 +47,13 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.gpu:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available but --gpu was requested.")
+        device = "cuda"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training on device: {device}")
     normalize = transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761])
     transform = transforms.Compose(
         [
