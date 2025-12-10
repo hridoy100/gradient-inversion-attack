@@ -148,7 +148,8 @@ def diffusion_guided_reconstruction(
     diffusion_model: UNet2DModel,
     scheduler: DDPMScheduler,
     diffusion_steps: int = 50,
-    match_lr: float = 0.2,
+    match_lr: float = 0.1,
+    match_steps: int = 5,
     label_lr: float = 0.05,
     tv_weight: float = 0.0,
     log_every: int = 20,
@@ -156,26 +157,28 @@ def diffusion_guided_reconstruction(
     """Reconstruct data by alternating gradient matching with diffusion denoising."""
     device = target_gradients[0].device
     scheduler.set_timesteps(diffusion_steps)
-    current = torch.randn(data_shape, device=device)
+    current = torch.randn(data_shape, device=device) * scheduler.init_noise_sigma
     label_logits = torch.randn((data_shape[0], num_classes), device=device, requires_grad=True)
     label_opt = torch.optim.Adam([label_logits], lr=label_lr)
 
     history = []
     for step, timestep in enumerate(scheduler.timesteps):
-        current = current.detach().requires_grad_(True)
-        label_opt.zero_grad()
+        for _ in range(match_steps):
+            current = current.detach().requires_grad_(True)
+            label_opt.zero_grad()
 
-        total_loss, grad_loss, tv_loss = gradient_match_loss(
-            current, label_logits, model, target_gradients, arch, tv_weight=tv_weight
-        )
-        total_loss.backward()
+            total_loss, grad_loss, tv_loss = gradient_match_loss(
+                current, label_logits, model, target_gradients, arch, tv_weight=tv_weight
+            )
+            total_loss.backward()
+
+            with torch.no_grad():
+                current = current - match_lr * current.grad
+                current.clamp_(-1.0, 1.0)  # keep iterates in diffusion's input range
+            label_opt.step()
 
         with torch.no_grad():
-            current = current - match_lr * current.grad
-        label_opt.step()
-
-        with torch.no_grad():
-            noisy_latent = current
+            noisy_latent = current.detach()
             noise_pred = diffusion_model(noisy_latent, timestep).sample
             diffusion_out = scheduler.step(noise_pred, timestep, noisy_latent)
             prior_loss = F.mse_loss(noisy_latent, diffusion_out.pred_original_sample).item()
@@ -270,7 +273,8 @@ def parse_args():
     parser.add_argument(
         "--diffusion-steps", type=int, default=50, help="Number of denoising steps for the diffusion prior."
     )
-    parser.add_argument("--match-lr", type=float, default=0.2, help="Step size for gradient matching updates.")
+    parser.add_argument("--match-steps", type=int, default=5, help="Gradient updates per diffusion denoise step.")
+    parser.add_argument("--match-lr", type=float, default=0.1, help="Step size for gradient matching updates.")
     parser.add_argument("--label-lr", type=float, default=0.05, help="Step size for label logit updates.")
     parser.add_argument("--tv-weight", type=float, default=0.0, help="Total-variation weight on reconstructed images.")
     parser.add_argument("--log-every", type=int, default=20, help="Store loss entries every N diffusion steps.")
@@ -340,6 +344,7 @@ def main():
         "num_clients": args.num_clients,
         "samples_per_client": args.samples_per_client,
         "diffusion_steps": args.diffusion_steps,
+        "match_steps": args.match_steps,
         "match_lr": args.match_lr,
         "label_lr": args.label_lr,
         "tv_weight": args.tv_weight,
@@ -363,6 +368,7 @@ def main():
             scheduler=scheduler,
             diffusion_steps=args.diffusion_steps,
             match_lr=args.match_lr,
+            match_steps=args.match_steps,
             label_lr=args.label_lr,
             tv_weight=args.tv_weight,
             log_every=args.log_every,
