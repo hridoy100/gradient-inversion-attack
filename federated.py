@@ -104,7 +104,7 @@ def gradient_inversion(
     progress: bool = False,
 ):
     """Run gradient matching to recover training data from shared gradients."""
-    best = {"loss": float("inf"), "data": None, "labels": None, "history": None}
+    best = {"loss": float("inf"), "data": None, "labels": None, "history": None, "iteration": None, "restart": None}
 
     for attempt in range(restarts):
         if init_seed is not None:
@@ -146,21 +146,23 @@ def gradient_inversion(
             loss_val = optimizer.step(closure)
             last_loss_val = loss_val
 
+            loss_item = loss_val.item()
+            if loss_item < best["loss"]:
+                with torch.no_grad():
+                    best["loss"] = loss_item
+                    best["data"] = dummy_data.detach().clone()
+                    best["labels"] = F.softmax(dummy_label, dim=-1).detach().clone()
+                    best["history"] = history.copy()
+                    best["iteration"] = iters
+                    best["restart"] = attempt
+
             if iters % log_every == 0 or iters == iterations - 1:
                 history.append(
                     {
                         "iteration": iters,
-                        "loss": loss_val.item(),
+                        "loss": loss_item,
                         "data": dummy_data.detach().clone(),
                     }
                 )
-
-        final_loss = last_loss_val.item() if last_loss_val is not None else float("inf")
-        if final_loss < best["loss"]:
-            with torch.no_grad():
-                best["loss"] = final_loss
-                best["data"] = dummy_data.detach().clone()
-                best["labels"] = F.softmax(dummy_label, dim=-1).detach().clone()
-                best["history"] = history
 
     return best["data"], best["labels"], best["history"]

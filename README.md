@@ -47,5 +47,14 @@ Key options:
 - `--no-save`: disable saving reconstructions to disk.
 - `--data-root`: dataset location (defaults to `~/.torch`; downloads CIFAR100 if missing).
 
+## Diffusion-based reconstruction (evaluation)
+`evaluations/diffusion_reconstruction/run.py` reconstructs client data while denoising each iterate with a pretrained DDPM prior (`google/ddpm-cifar10-32` from Hugging Face diffusers). Install the extra dependency with `pip install diffusers`.
+
+Example:
+```
+python3 evaluations/diffusion_reconstruction/run.py --num-clients 1 --samples-per-client 1 --diffusion-steps 50 --log-every 20 --save-dir outputs/diffusion_dlg
+```
+Outputs (images, loss traces, metrics) are stored under a timestamped subfolder of `--save-dir`.
+
 ## License
 MIT; see [LICENSE](LICENSE).
