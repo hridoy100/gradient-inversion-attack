@@ -43,6 +43,8 @@ Key options:
 - `--apply-agg-step`: apply one gradient step to the server model using aggregated gradients before inversion.
 - `--agg-lr`: learning rate for the aggregated step (used with `--apply-agg-step`).
 - `--no-progress`: disable tqdm progress bars during inversion (enabled by default).
+- `--save-dir`: base directory to save reconstruction images/metadata (`outputs/reconstructions` by default).
+- `--no-save`: disable saving reconstructions to disk.
 - `--data-root`: dataset location (defaults to `~/.torch`; downloads CIFAR100 if missing).
 
 ## License

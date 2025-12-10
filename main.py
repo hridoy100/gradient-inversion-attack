@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 import argparse
+import json
+import time
+from pathlib import Path
 from typing import List
 
 import matplotlib.pyplot as plt
@@ -32,6 +35,11 @@ def build_denormalize(arch: str):
         return t * std + mean
 
     return denorm
+
+
+def save_image(tensor: torch.Tensor, path: Path, denormalize=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    to_safe_pil(tensor, denormalize).save(path)
 
 
 def parse_args():
@@ -107,6 +115,19 @@ def parse_args():
         type=float,
         default=0.1,
         help="Learning rate for the aggregated gradient step when --apply-agg-step is set.",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="outputs/reconstructions",
+        help="Directory to save reconstruction outputs (images/metadata).",
+    )
+    parser.add_argument(
+        "--no-save",
+        dest="save_outputs",
+        action="store_false",
+        default=True,
+        help="Disable saving reconstruction outputs to disk.",
     )
     parser.add_argument(
         "--client-indices",
@@ -217,7 +238,60 @@ def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: t
             plt.title(f"Aggregated Iter {entry['iteration']}\nLoss {entry['loss']:.2f}")
             plt.axis("off")
 
-    plt.tight_layout()
+        plt.tight_layout()
+
+
+def save_reconstructions(
+    run_dir: Path,
+    per_client_results,
+    aggregated_result,
+    clients,
+    denormalize,
+    indices,
+    args,
+    all_real_data: torch.Tensor = None,
+):
+    """Persist reconstructions and metadata to disk."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "arch": args.arch,
+        "pretrained": args.pretrained,
+        "seed": args.seed,
+        "indices": indices,
+        "num_clients": args.num_clients,
+        "samples_per_client": args.samples_per_client,
+        "iterations": args.iterations,
+        "tv_weight": args.tv_weight,
+        "init_scale": args.init_scale,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    for result in per_client_results:
+        client = result["client"]
+        recovered_data = result["recovered_data"]
+        history = result["history"]
+        client_dir = run_dir / f"client_{client.client_id}"
+        for idx in range(recovered_data.size(0)):
+            save_image(client.data[idx], client_dir / f"original_{idx}.png", denormalize)
+            save_image(recovered_data[idx], client_dir / f"reconstructed_{idx}.png")
+        if history:
+            hist_dir = client_dir / "history"
+            for entry in history:
+                save_image(entry["data"][0], hist_dir / f"iter_{entry['iteration']}.png", denormalize)
+
+    if aggregated_result and all_real_data is not None:
+        agg_dir = run_dir / "aggregated"
+        recovered_data = aggregated_result["recovered_data"]
+        history = aggregated_result["history"]
+        total_samples = min(recovered_data.size(0), all_real_data.size(0))
+        for idx in range(total_samples):
+            save_image(all_real_data[idx], agg_dir / f"original_{idx}.png", denormalize)
+            save_image(recovered_data[idx], agg_dir / f"reconstructed_{idx}.png")
+        if history:
+            hist_dir = agg_dir / "history"
+            for entry in history:
+                save_image(entry["data"][0], hist_dir / f"iter_{entry['iteration']}.png", denormalize)
 
 
 def main():
@@ -299,10 +373,26 @@ def main():
         aggregated_result = {"recovered_data": recovered_data, "history": history, "recovered_labels": recovered_labels}
         print("Aggregated reconstruction complete.")
 
+    all_real_data = torch.cat([client.data for client in clients], dim=0) if aggregated_result else None
+
+    if args.save_outputs:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(args.save_dir) / f"run_{timestamp}"
+        save_reconstructions(
+            run_dir,
+            per_client_results,
+            aggregated_result,
+            clients,
+            denormalize,
+            indices,
+            args,
+            all_real_data,
+        )
+        print(f"Saved reconstructions to {run_dir}")
+
     if per_client_results:
         visualize_per_client_recovery(per_client_results, args.samples_per_client, denormalize)
     if aggregated_result:
-        all_real_data = torch.cat([client.data for client in clients], dim=0)
         visualize_aggregated_recovery(all_real_data, aggregated_result["recovered_data"], aggregated_result["history"], denormalize)
 
     plt.show()
