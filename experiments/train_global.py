@@ -12,11 +12,11 @@ if str(ROOT) not in sys.path:
 
 import torch
 import torch.nn.functional as F
-from torch import nn, optim
+from torch import optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
+from torchvision import datasets, transforms
 
-from models.vision import LeNet, weights_init
+from models.vision_new import MODEL_BUILDERS, build_model
 
 
 def parse_args():
@@ -39,8 +39,13 @@ def parse_args():
         "--arch",
         type=str,
         default="lenet",
-        choices=["lenet", "resnet18"],
+        choices=sorted(MODEL_BUILDERS.keys()),
         help="Model architecture to train.",
+    )
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Use torchvision pretrained weights when available for the selected architecture.",
     )
     return parser.parse_args()
 
@@ -66,13 +71,7 @@ def main():
     train_set = datasets.CIFAR100(args.data_root, train=True, download=True, transform=transform)
     loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=2)
 
-    if args.arch == "lenet":
-        model = LeNet().to(device)
-        model.apply(weights_init)
-    elif args.arch == "resnet18":
-        model = models.resnet18(num_classes=100).to(device)
-    else:
-        raise ValueError(f"Unsupported architecture: {args.arch}")
+    model = build_model(args.arch, num_classes=100, pretrained=args.pretrained).to(device)
 
     optimizer = optim.SGD(
         model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay

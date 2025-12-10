@@ -8,7 +8,7 @@ from PIL import Image
 from torchvision import datasets, transforms
 
 from federated import FederatedClient, FederatedServer
-from models.vision import LeNet, weights_init
+from models.vision_new import MODEL_BUILDERS, build_model, default_transform
 
 
 def to_safe_pil(img_tensor: torch.Tensor) -> Image.Image:
@@ -20,6 +20,31 @@ def to_safe_pil(img_tensor: torch.Tensor) -> Image.Image:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Federated Deep Leakage from Gradients.")
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default="lenet",
+        choices=sorted(MODEL_BUILDERS.keys()),
+        help="Model architecture to use for clients and server.",
+    )
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Use torchvision pretrained weights when available for the selected architecture.",
+    )
+    parser.add_argument(
+        "--bn-eval",
+        dest="bn_eval",
+        action="store_true",
+        default=True,
+        help="Force BatchNorm layers to eval mode (recommended for tiny batch sizes like 1).",
+    )
+    parser.add_argument(
+        "--no-bn-eval",
+        dest="bn_eval",
+        action="store_false",
+        help="Keep BatchNorm layers in training mode.",
+    )
     parser.add_argument("--num-clients", type=int, default=3, help="Number of federated clients.")
     parser.add_argument("--samples-per-client", type=int, default=1, help="Samples held by each client.")
     parser.add_argument("--iterations", type=int, default=300, help="LBFGS steps for reconstruction.")
@@ -177,7 +202,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device}")
 
-    transform = transforms.ToTensor()
+    transform = default_transform(args.arch)
     dataset = datasets.CIFAR100(args.data_root, download=True, transform=transform)
     num_classes = 100
     total_samples = args.num_clients * args.samples_per_client
@@ -186,8 +211,10 @@ def main():
     indices = pick_indices(args, total_samples, len(dataset))
     print(f"Using dataset indices: {indices}")
 
-    model = LeNet().to(device)
-    model.apply(weights_init)
+    model = build_model(args.arch, num_classes=num_classes, pretrained=args.pretrained).to(device)
+    if args.bn_eval and args.arch.lower() != "lenet":
+        # Keep BatchNorm layers in eval mode to avoid small-batch failures (batch=1 and 1x1 feature maps).
+        model.eval()
 
     clients = build_clients(dataset, indices, args.num_clients, args.samples_per_client, device, num_classes)
     server = FederatedServer(model=model, device=device, num_classes=num_classes)
