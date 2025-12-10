@@ -1,0 +1,15 @@
+{
+  "arch": "resnet50",
+  "pretrained": true,
+  "seed": 1234,
+  "indices": [
+    19775,
+    41921
+  ],
+  "num_clients": 2,
+  "samples_per_client": 1,
+  "iterations": 800,
+  "tv_weight": 0.001,
+  "init_scale": 0.05,
+  "timestamp": "2025-12-10 01:43:05"
+}
