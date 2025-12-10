@@ -23,6 +23,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Newer diffusers expects torch.xpu; older torch (<2.0) lacks it, so stub it for compatibility.
+if not hasattr(torch, "xpu"):
+    class _DummyXPU:
+        @staticmethod
+        def empty_cache():
+            return None
+    torch.xpu = _DummyXPU()  # type: ignore[attr-defined]
+
 try:
     from diffusers import DDPMScheduler, UNet2DModel
 except ImportError as exc:  # pragma: no cover - dependency message only
@@ -149,8 +157,10 @@ def diffusion_guided_reconstruction(
     scheduler: DDPMScheduler,
     diffusion_steps: int = 50,
     match_lr: float = 0.1,
+    match_lr_end: float = 0.01,
     match_steps: int = 5,
     label_lr: float = 0.05,
+    label_lr_end: float = 0.01,
     tv_weight: float = 0.0,
     log_every: int = 20,
 ):
@@ -162,7 +172,15 @@ def diffusion_guided_reconstruction(
     label_opt = torch.optim.Adam([label_logits], lr=label_lr)
 
     history = []
+    total_steps = len(scheduler.timesteps)
     for step, timestep in enumerate(scheduler.timesteps):
+        # Cosine-ish decay to allow coarse steps early and fine steps late.
+        progress = step / max(total_steps - 1, 1)
+        match_lr_now = match_lr * (1 - progress) + match_lr_end * progress
+        label_lr_now = label_lr * (1 - progress) + label_lr_end * progress
+        for g in label_opt.param_groups:
+            g["lr"] = label_lr_now
+
         for _ in range(match_steps):
             current = current.detach().requires_grad_(True)
             label_opt.zero_grad()
@@ -173,7 +191,7 @@ def diffusion_guided_reconstruction(
             total_loss.backward()
 
             with torch.no_grad():
-                current = current - match_lr * current.grad
+                current = current - match_lr_now * current.grad
                 current.clamp_(-1.0, 1.0)  # keep iterates in diffusion's input range
             label_opt.step()
 
@@ -274,8 +292,10 @@ def parse_args():
         "--diffusion-steps", type=int, default=50, help="Number of denoising steps for the diffusion prior."
     )
     parser.add_argument("--match-steps", type=int, default=5, help="Gradient updates per diffusion denoise step.")
-    parser.add_argument("--match-lr", type=float, default=0.1, help="Step size for gradient matching updates.")
-    parser.add_argument("--label-lr", type=float, default=0.05, help="Step size for label logit updates.")
+    parser.add_argument("--match-lr", type=float, default=0.1, help="Initial step size for gradient matching updates.")
+    parser.add_argument("--match-lr-end", type=float, default=0.01, help="Final step size for gradient matching.")
+    parser.add_argument("--label-lr", type=float, default=0.05, help="Initial step size for label logit updates.")
+    parser.add_argument("--label-lr-end", type=float, default=0.01, help="Final step size for label logit updates.")
     parser.add_argument("--tv-weight", type=float, default=0.0, help="Total-variation weight on reconstructed images.")
     parser.add_argument("--log-every", type=int, default=20, help="Store loss entries every N diffusion steps.")
     parser.add_argument(
@@ -346,7 +366,9 @@ def main():
         "diffusion_steps": args.diffusion_steps,
         "match_steps": args.match_steps,
         "match_lr": args.match_lr,
+        "match_lr_end": args.match_lr_end,
         "label_lr": args.label_lr,
+        "label_lr_end": args.label_lr_end,
         "tv_weight": args.tv_weight,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "checkpoint": args.checkpoint,
