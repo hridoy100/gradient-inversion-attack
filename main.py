@@ -8,14 +8,30 @@ from PIL import Image
 from torchvision import datasets, transforms
 
 from federated import FederatedClient, FederatedServer
-from models.vision_new import MODEL_BUILDERS, build_model, default_transform
+from models.vision_new import CIFAR100_MEAN, CIFAR100_STD, MODEL_BUILDERS, build_model, default_transform
 
 
-def to_safe_pil(img_tensor: torch.Tensor) -> Image.Image:
-    """Convert tensor to PIL image, sanitizing NaNs/Infs and clamping to [0, 1]."""
-    img_tensor = torch.nan_to_num(img_tensor.detach().cpu(), nan=0.0, posinf=1.0, neginf=0.0)
+def to_safe_pil(img_tensor: torch.Tensor, denormalize=None) -> Image.Image:
+    """Convert tensor to PIL image, optional unnormalize first, clamp to [0, 1]."""
+    img_tensor = img_tensor.detach().cpu()
+    if denormalize:
+        img_tensor = denormalize(img_tensor)
+    img_tensor = torch.nan_to_num(img_tensor, nan=0.0, posinf=1.0, neginf=0.0)
     img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
     return transforms.ToPILImage()(img_tensor)
+
+
+def build_denormalize(arch: str):
+    """Return a denormalization fn for visualization given the chosen arch."""
+    if arch.lower() == "lenet":
+        return None
+    mean = torch.tensor(CIFAR100_MEAN).view(3, 1, 1)
+    std = torch.tensor(CIFAR100_STD).view(3, 1, 1)
+
+    def denorm(t: torch.Tensor) -> torch.Tensor:
+        return t * std + mean
+
+    return denorm
 
 
 def parse_args():
@@ -80,6 +96,13 @@ def parse_args():
         help="Apply one gradient descent step on the server model using the aggregated gradients before inversion.",
     )
     parser.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        default=True,
+        help="Disable tqdm progress bars during inversion iterations.",
+    )
+    parser.add_argument(
         "--agg-lr",
         type=float,
         default=0.1,
@@ -137,7 +160,7 @@ def build_clients(dataset, indices: List[int], num_clients: int, samples_per_cli
     return clients
 
 
-def visualize_per_client_recovery(per_client_results, samples_per_client: int):
+def visualize_per_client_recovery(per_client_results, samples_per_client: int, denormalize=None):
     """Plot original vs reconstructed data for each client separately."""
     for result in per_client_results:
         client = result["client"]
@@ -148,7 +171,7 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int):
         plt.figure(figsize=(2.5 * cols, 5))
         for idx in range(cols):
             plt.subplot(2, cols, idx + 1)
-            plt.imshow(to_safe_pil(client.data[idx]))
+            plt.imshow(to_safe_pil(client.data[idx], denormalize))
             plt.title(f"Client {client.client_id} sample {idx}")
             plt.axis("off")
 
@@ -161,14 +184,14 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int):
             plt.figure(figsize=(3 * len(history), 3))
             for i, entry in enumerate(history):
                 plt.subplot(1, len(history), i + 1)
-                plt.imshow(to_safe_pil(entry["data"][0]))
+                plt.imshow(to_safe_pil(entry["data"][0], denormalize))
                 plt.title(f"C{client.client_id} Iter {entry['iteration']}\nLoss {entry['loss']:.2f}")
                 plt.axis("off")
 
         plt.tight_layout()
 
 
-def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: torch.Tensor, history):
+def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: torch.Tensor, history, denormalize=None):
     """Plot aggregated reconstruction against the stacked real data."""
     total_samples = min(recovered_data.size(0), all_real_data.size(0))
     cols = min(total_samples, 8)
@@ -177,7 +200,7 @@ def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: t
     plt.figure(figsize=(2.5 * cols, 5))
     for idx in range(cols):
         plt.subplot(rows, cols, idx + 1)
-        plt.imshow(to_safe_pil(all_real_data[idx]))
+        plt.imshow(to_safe_pil(all_real_data[idx], denormalize))
         plt.title(f"Real {idx}")
         plt.axis("off")
 
@@ -190,7 +213,7 @@ def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: t
         plt.figure(figsize=(3 * len(history), 3))
         for i, entry in enumerate(history):
             plt.subplot(1, len(history), i + 1)
-            plt.imshow(to_safe_pil(entry["data"][0]))
+            plt.imshow(to_safe_pil(entry["data"][0], denormalize))
             plt.title(f"Aggregated Iter {entry['iteration']}\nLoss {entry['loss']:.2f}")
             plt.axis("off")
 
@@ -206,6 +229,7 @@ def main():
     dataset = datasets.CIFAR100(args.data_root, download=True, transform=transform)
     num_classes = 100
     total_samples = args.num_clients * args.samples_per_client
+    denormalize = build_denormalize(args.arch)
 
     torch.manual_seed(args.seed)
     indices = pick_indices(args, total_samples, len(dataset))
@@ -239,6 +263,7 @@ def main():
                 init_seed=args.dummy_seed + client.client_id if args.dummy_seed is not None else None,
                 tv_weight=args.tv_weight,
                 init_scale=args.init_scale,
+                progress=args.progress,
             )
             per_client_results.append(
                 {
@@ -269,15 +294,16 @@ def main():
             init_seed=args.dummy_seed,
             tv_weight=args.tv_weight,
             init_scale=args.init_scale,
+            progress=args.progress,
         )
         aggregated_result = {"recovered_data": recovered_data, "history": history, "recovered_labels": recovered_labels}
         print("Aggregated reconstruction complete.")
 
     if per_client_results:
-        visualize_per_client_recovery(per_client_results, args.samples_per_client)
+        visualize_per_client_recovery(per_client_results, args.samples_per_client, denormalize)
     if aggregated_result:
         all_real_data = torch.cat([client.data for client in clients], dim=0)
-        visualize_aggregated_recovery(all_real_data, aggregated_result["recovered_data"], aggregated_result["history"])
+        visualize_aggregated_recovery(all_real_data, aggregated_result["recovered_data"], aggregated_result["history"], denormalize)
 
     plt.show()
 

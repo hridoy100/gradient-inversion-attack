@@ -42,6 +42,7 @@ Key options:
 - `--init-scale`: std multiplier for dummy data initialization (smaller can help aggregated runs).
 - `--apply-agg-step`: apply one gradient step to the server model using aggregated gradients before inversion.
 - `--agg-lr`: learning rate for the aggregated step (used with `--apply-agg-step`).
+- `--no-progress`: disable tqdm progress bars during inversion (enabled by default).
 - `--data-root`: dataset location (defaults to `~/.torch`; downloads CIFAR100 if missing).
 
 ## License

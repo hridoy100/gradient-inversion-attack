@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from typing import List, Tuple
 
+from tqdm.auto import tqdm
+
 from utils import label_to_onehot, cross_entropy_for_onehot
 
 
@@ -62,6 +64,7 @@ class FederatedServer:
         init_seed: int = None,
         tv_weight: float = 0.0,
         init_scale: float = 1.0,
+        progress: bool = False,
     ):
         """Reconstruct training data that matches the provided gradients."""
         return gradient_inversion(
@@ -76,6 +79,7 @@ class FederatedServer:
             init_seed=init_seed,
             tv_weight=tv_weight,
             init_scale=init_scale,
+            progress=progress,
         )
 
     def apply_gradient_step(self, gradients: List[torch.Tensor], lr: float = 0.1):
@@ -97,6 +101,7 @@ def gradient_inversion(
     init_seed: int = None,
     tv_weight: float = 0.0,
     init_scale: float = 1.0,
+    progress: bool = False,
 ):
     """Run gradient matching to recover training data from shared gradients."""
     best = {"loss": float("inf"), "data": None, "labels": None, "history": None}
@@ -127,7 +132,11 @@ def gradient_inversion(
             return grad_diff
 
         last_loss_val = None
-        for iters in range(iterations):
+        iterator = range(iterations)
+        if progress:
+            iterator = tqdm(iterator, desc=f"Inversion {attempt+1}/{restarts}", leave=False)
+
+        for iters in iterator:
             def closure():
                 optimizer.zero_grad()
                 loss = gradient_match_loss()
