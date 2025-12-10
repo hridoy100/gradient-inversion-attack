@@ -9,6 +9,7 @@ saves reconstructed images, loss traces, and quality metrics per client.
 import argparse
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import List, Tuple
@@ -16,6 +17,11 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 from torchvision import datasets, transforms
+
+# Ensure repository root is importable when running this script directly.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
     from diffusers import DDPMScheduler, UNet2DModel

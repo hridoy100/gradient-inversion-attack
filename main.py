@@ -57,6 +57,12 @@ def parse_args():
         help="Use torchvision pretrained weights when available for the selected architecture.",
     )
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to a model checkpoint to load (state_dict). Overrides random init/fc when provided.",
+    )
+    parser.add_argument(
         "--bn-eval",
         dest="bn_eval",
         action="store_true",
@@ -310,6 +316,12 @@ def main():
     print(f"Using dataset indices: {indices}")
 
     model = build_model(args.arch, num_classes=num_classes, pretrained=args.pretrained).to(device)
+    if args.checkpoint:
+        state = torch.load(args.checkpoint, map_location=device)
+        # Handle both raw state_dict and dicts with a 'state_dict' key.
+        state_dict = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"Loaded checkpoint from {args.checkpoint}. missing_keys={missing}, unexpected_keys={unexpected}")
     if args.bn_eval and args.arch.lower() != "lenet":
         # Keep BatchNorm layers in eval mode to avoid small-batch failures (batch=1 and 1x1 feature maps).
         model.eval()

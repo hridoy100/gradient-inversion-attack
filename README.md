@@ -42,6 +42,7 @@ Key options:
 - `--init-scale`: std multiplier for dummy data initialization (smaller can help aggregated runs).
 - `--apply-agg-step`: apply one gradient step to the server model using aggregated gradients before inversion.
 - `--agg-lr`: learning rate for the aggregated step (used with `--apply-agg-step`).
+- `--checkpoint`: path to a model state_dict to load (overrides random init).
 - `--no-progress`: disable tqdm progress bars during inversion (enabled by default).
 - `--save-dir`: base directory to save reconstruction images/metadata (`outputs/reconstructions` by default).
 - `--no-save`: disable saving reconstructions to disk.
