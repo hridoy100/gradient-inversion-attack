@@ -138,6 +138,7 @@ def gradient_match_loss(
     target_gradients: List[torch.Tensor],
     arch: str,
     tv_weight: float = 0.0,
+    grad_loss_mode: str = "l2mean",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Squared gradient matching loss with optional TV regularization."""
     model_input = normalize_for_model(dummy_data, arch)
@@ -145,7 +146,19 @@ def gradient_match_loss(
     dummy_onehot = F.softmax(label_logits, dim=-1)
     dummy_loss = cross_entropy_for_onehot(pred, dummy_onehot)
     dummy_dy_dx = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
-    grad_loss = sum(((gx - gy) ** 2).sum() for gx, gy in zip(dummy_dy_dx, target_gradients))
+    if grad_loss_mode not in {"l2sum", "l2mean", "cosine"}:
+        raise ValueError("grad_loss_mode must be one of: l2sum, l2mean, cosine")
+
+    if grad_loss_mode == "cosine":
+        grad_loss = torch.tensor(0.0, device=dummy_data.device)
+        for gx, gy in zip(dummy_dy_dx, target_gradients):
+            gx_f = gx.reshape(-1)
+            gy_f = gy.reshape(-1)
+            denom = (torch.norm(gx_f) * torch.norm(gy_f)).clamp_min(1e-12)
+            grad_loss = grad_loss + (1.0 - torch.sum(gx_f * gy_f) / denom)
+    else:
+        reduce_fn = torch.sum if grad_loss_mode == "l2sum" else torch.mean
+        grad_loss = sum(reduce_fn((gx - gy) ** 2) for gx, gy in zip(dummy_dy_dx, target_gradients))
 
     tv_loss = torch.tensor(0.0, device=dummy_data.device)
     if tv_weight > 0:
@@ -166,6 +179,7 @@ def diffusion_guided_reconstruction(
     prior_weight: float = 0.0,
     prior_t_min: int = 0,
     prior_t_max: int = None,
+    grad_loss_mode: str = "l2mean",
     diffusion_steps: int = 50,
     match_lr: float = 0.1,
     match_lr_end: float = 0.01,
@@ -215,7 +229,13 @@ def diffusion_guided_reconstruction(
             label_opt.zero_grad()
 
             total_loss, grad_loss, tv_loss = gradient_match_loss(
-                current, label_logits, model, target_gradients, arch, tv_weight=tv_weight
+                current,
+                label_logits,
+                model,
+                target_gradients,
+                arch,
+                tv_weight=tv_weight,
+                grad_loss_mode=grad_loss_mode,
             )
             prior_loss = torch.tensor(0.0, device=device)
             if prior_mode == "score" and prior_weight > 0:
@@ -382,7 +402,7 @@ def parse_args():
     parser.add_argument(
         "--prior-weight",
         type=float,
-        default=0.1,
+        default=1.0,
         help="Weight of diffusion score-matching prior when --prior-mode=score.",
     )
     parser.add_argument(
@@ -396,6 +416,12 @@ def parse_args():
         type=int,
         default=None,
         help="Maximum diffusion timestep sampled for the prior regularizer (score mode). Default: scheduler config.",
+    )
+    parser.add_argument(
+        "--grad-loss-mode",
+        choices=["l2mean", "l2sum", "cosine"],
+        default="l2mean",
+        help="Gradient matching loss reduction; l2mean usually scales better than l2sum.",
     )
     parser.add_argument(
         "--diffusion-model",
@@ -516,6 +542,7 @@ def main():
         "prior_weight": args.prior_weight,
         "prior_t_min": args.prior_t_min,
         "prior_t_max": args.prior_t_max,
+        "grad_loss_mode": args.grad_loss_mode,
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -540,6 +567,7 @@ def main():
                 prior_weight=args.prior_weight,
                 prior_t_min=args.prior_t_min,
                 prior_t_max=args.prior_t_max,
+                grad_loss_mode=args.grad_loss_mode,
                 diffusion_steps=args.diffusion_steps,
                 match_lr=args.match_lr,
                 match_steps=args.match_steps,
@@ -596,6 +624,7 @@ def main():
             prior_weight=args.prior_weight,
             prior_t_min=args.prior_t_min,
             prior_t_max=args.prior_t_max,
+            grad_loss_mode=args.grad_loss_mode,
             diffusion_steps=args.diffusion_steps,
             match_lr=args.match_lr,
             match_steps=args.match_steps,
