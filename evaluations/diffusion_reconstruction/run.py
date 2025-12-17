@@ -162,6 +162,10 @@ def diffusion_guided_reconstruction(
     arch: str,
     diffusion_model: UNet2DModel,
     scheduler: DDPMScheduler,
+    prior_mode: str = "denoise",
+    prior_weight: float = 0.0,
+    prior_t_min: int = 0,
+    prior_t_max: int = None,
     diffusion_steps: int = 50,
     match_lr: float = 0.1,
     match_lr_end: float = 0.01,
@@ -171,17 +175,34 @@ def diffusion_guided_reconstruction(
     tv_weight: float = 0.0,
     log_every: int = 20,
 ):
-    """Reconstruct data by alternating gradient matching with diffusion denoising."""
+    """Reconstruct data from gradients using a diffusion prior.
+
+    prior_mode:
+      - "denoise": alternate gradient matching with scheduler denoising steps (legacy; can be unstable).
+      - "score": optimize a clean image directly with a score-matching prior term (more stable).
+    """
     device = target_gradients[0].device
-    scheduler.set_timesteps(diffusion_steps)
-    current = torch.randn(data_shape, device=device) * scheduler.init_noise_sigma
+    if prior_t_max is None:
+        prior_t_max = int(getattr(scheduler.config, "num_train_timesteps", 1000) - 1)
+
+    if prior_mode == "denoise":
+        scheduler.set_timesteps(diffusion_steps)
+        current = torch.randn(data_shape, device=device) * scheduler.init_noise_sigma
+    elif prior_mode == "score":
+        # Optimize a clean image estimate directly in diffusion space [-1, 1].
+        current = torch.randn(data_shape, device=device).clamp_(-1.0, 1.0)
+    else:
+        raise ValueError("prior_mode must be 'denoise' or 'score'.")
+
     label_logits = torch.randn((data_shape[0], num_classes), device=device, requires_grad=True)
     label_opt = torch.optim.Adam([label_logits], lr=label_lr)
 
     history = []
     best = {"loss": float("inf"), "data": None, "labels": None}
-    total_steps = len(scheduler.timesteps)
-    for step, timestep in enumerate(scheduler.timesteps):
+    total_steps = diffusion_steps if prior_mode == "score" else len(scheduler.timesteps)
+    iterator = range(total_steps)
+    for step in iterator:
+        timestep = scheduler.timesteps[step] if prior_mode == "denoise" else None
         # Cosine-ish decay to allow coarse steps early and fine steps late.
         progress = step / max(total_steps - 1, 1)
         match_lr_now = match_lr * (1 - progress) + match_lr_end * progress
@@ -196,6 +217,17 @@ def diffusion_guided_reconstruction(
             total_loss, grad_loss, tv_loss = gradient_match_loss(
                 current, label_logits, model, target_gradients, arch, tv_weight=tv_weight
             )
+            prior_loss = torch.tensor(0.0, device=device)
+            if prior_mode == "score" and prior_weight > 0:
+                # Score-matching prior regularizer: encourage the current image to be likely under the diffusion model.
+                t = torch.randint(prior_t_min, prior_t_max + 1, (current.size(0),), device=device).long()
+                noise = torch.randn_like(current)
+                x_t = scheduler.add_noise(current, noise, t)
+                x_t_in = scheduler.scale_model_input(x_t, t) if hasattr(scheduler, "scale_model_input") else x_t
+                noise_pred = diffusion_model(x_t_in, t).sample
+                prior_loss = F.mse_loss(noise_pred, noise)
+                total_loss = total_loss + prior_weight * prior_loss
+
             total_loss.backward()
 
             with torch.no_grad():
@@ -203,27 +235,28 @@ def diffusion_guided_reconstruction(
                 current.clamp_(-1.0, 1.0)  # keep iterates in diffusion's input range
             label_opt.step()
 
-        with torch.no_grad():
-            noisy_latent = current.detach()
-            # Some schedulers expect inputs to be scaled before step.
-            model_latent = scheduler.scale_model_input(noisy_latent, timestep) if hasattr(scheduler, "scale_model_input") else noisy_latent
-            noise_pred = diffusion_model(model_latent, timestep).sample
-            diffusion_out = scheduler.step(noise_pred, timestep, noisy_latent)
-            # Some schedulers (e.g., DDPM/UniPC) expose pred_original_sample; others (e.g., DPM++) do not.
-            if hasattr(diffusion_out, "pred_original_sample") and diffusion_out.pred_original_sample is not None:
-                prior_loss = F.mse_loss(noisy_latent, diffusion_out.pred_original_sample).item()
-            elif hasattr(diffusion_out, "prev_sample") and diffusion_out.prev_sample is not None:
-                prior_loss = F.mse_loss(noisy_latent, diffusion_out.prev_sample).item()
-            else:
-                prior_loss = 0.0
-            current = diffusion_out.prev_sample
+        if prior_mode == "denoise":
+            with torch.no_grad():
+                noisy_latent = current.detach()
+                # Some schedulers expect inputs to be scaled before step.
+                model_latent = (
+                    scheduler.scale_model_input(noisy_latent, timestep)
+                    if hasattr(scheduler, "scale_model_input")
+                    else noisy_latent
+                )
+                noise_pred = diffusion_model(model_latent, timestep).sample
+                diffusion_out = scheduler.step(noise_pred, timestep, noisy_latent)
+                current = diffusion_out.prev_sample
+            prior_loss_val = 0.0
+        else:
+            prior_loss_val = float(prior_loss.item()) if prior_weight > 0 else 0.0
 
-        if step % log_every == 0 or step == len(scheduler.timesteps) - 1:
+        if step % log_every == 0 or step == total_steps - 1:
             history.append(
                 {
                     "step": int(step),
                     "grad_loss": float(grad_loss.item()),
-                    "prior_loss": float(prior_loss),
+                    "prior_loss": float(prior_loss_val),
                     "total_loss": float(total_loss.item()),
                     "tv_loss": float(tv_loss.item()) if tv_weight > 0 else 0.0,
                 }
@@ -328,7 +361,10 @@ def parse_args():
         help="Reconstruct per-client gradients, aggregated gradients, or both.",
     )
     parser.add_argument(
-        "--diffusion-steps", type=int, default=50, help="Number of denoising steps for the diffusion prior."
+        "--diffusion-steps",
+        type=int,
+        default=50,
+        help="Number of outer steps (denoise steps in prior-mode=denoise; optimization steps in prior-mode=score).",
     )
     parser.add_argument("--match-steps", type=int, default=5, help="Gradient updates per diffusion denoise step.")
     parser.add_argument("--match-lr", type=float, default=0.1, help="Initial step size for gradient matching updates.")
@@ -337,6 +373,30 @@ def parse_args():
     parser.add_argument("--label-lr-end", type=float, default=0.01, help="Final step size for label logit updates.")
     parser.add_argument("--tv-weight", type=float, default=0.0, help="Total-variation weight on reconstructed images.")
     parser.add_argument("--log-every", type=int, default=20, help="Store loss entries every N diffusion steps.")
+    parser.add_argument(
+        "--prior-mode",
+        choices=["denoise", "score"],
+        default="score",
+        help="How to use the diffusion model as a prior (score is generally more stable).",
+    )
+    parser.add_argument(
+        "--prior-weight",
+        type=float,
+        default=0.1,
+        help="Weight of diffusion score-matching prior when --prior-mode=score.",
+    )
+    parser.add_argument(
+        "--prior-t-min",
+        type=int,
+        default=0,
+        help="Minimum diffusion timestep sampled for the prior regularizer (score mode).",
+    )
+    parser.add_argument(
+        "--prior-t-max",
+        type=int,
+        default=None,
+        help="Maximum diffusion timestep sampled for the prior regularizer (score mode). Default: scheduler config.",
+    )
     parser.add_argument(
         "--diffusion-model",
         type=str,
@@ -419,9 +479,12 @@ def main():
         model.eval()
 
     clients = build_clients(dataset, indices, args.num_clients, args.samples_per_client, device, num_classes)
-    diffusion_model, scheduler = load_diffusion_prior(
-        device, repo_id=args.diffusion_model, scheduler_type=args.scheduler
-    )
+    scheduler_type = args.scheduler
+    if args.prior_mode == "score" and scheduler_type != "ddpm":
+        # Score mode relies on a training-like noise schedule (add_noise); DDPM is the safest default.
+        print("prior-mode=score: overriding --scheduler to 'ddpm' for add_noise compatibility.")
+        scheduler_type = "ddpm"
+    diffusion_model, scheduler = load_diffusion_prior(device, repo_id=args.diffusion_model, scheduler_type=scheduler_type)
     server = FederatedServer(model, device=device, num_classes=num_classes)
 
     run_dir = Path(args.save_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -448,7 +511,11 @@ def main():
         "apply_agg_step": args.apply_agg_step,
         "agg_lr": args.agg_lr,
         "diffusion_model": args.diffusion_model,
-        "scheduler": args.scheduler,
+        "scheduler": scheduler_type,
+        "prior_mode": args.prior_mode,
+        "prior_weight": args.prior_weight,
+        "prior_t_min": args.prior_t_min,
+        "prior_t_max": args.prior_t_max,
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -469,6 +536,10 @@ def main():
                 arch=args.arch,
                 diffusion_model=diffusion_model,
                 scheduler=scheduler,
+                prior_mode=args.prior_mode,
+                prior_weight=args.prior_weight,
+                prior_t_min=args.prior_t_min,
+                prior_t_max=args.prior_t_max,
                 diffusion_steps=args.diffusion_steps,
                 match_lr=args.match_lr,
                 match_steps=args.match_steps,
@@ -521,6 +592,10 @@ def main():
             arch=args.arch,
             diffusion_model=diffusion_model,
             scheduler=scheduler,
+            prior_mode=args.prior_mode,
+            prior_weight=args.prior_weight,
+            prior_t_min=args.prior_t_min,
+            prior_t_max=args.prior_t_max,
             diffusion_steps=args.diffusion_steps,
             match_lr=args.match_lr,
             match_steps=args.match_steps,
