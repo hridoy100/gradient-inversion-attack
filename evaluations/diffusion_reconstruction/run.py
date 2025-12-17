@@ -32,7 +32,14 @@ if not hasattr(torch, "xpu"):
     torch.xpu = _DummyXPU()  # type: ignore[attr-defined]
 
 try:
-    from diffusers import DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler, UNet2DModel
+from diffusers import (
+    DDPMScheduler,
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    EulerDiscreteScheduler,
+    EulerAncestralDiscreteScheduler,
+    UNet2DModel,
+)
 except ImportError as exc:  # pragma: no cover - dependency message only
     raise ImportError(
         "diffusers is required for diffusion-guided reconstruction. "
@@ -269,6 +276,8 @@ def load_diffusion_prior(device: str, repo_id: str = "google/ddpm-cifar10-32", s
         "ddpm": DDPMScheduler,
         "ddim": DDIMScheduler,
         "dpmpp": DPMSolverMultistepScheduler,
+        "euler": EulerDiscreteScheduler,
+        "euler-ancestral": EulerAncestralDiscreteScheduler,
     }
     if scheduler_type not in schedulers:
         raise ValueError(f"Unsupported scheduler '{scheduler_type}'. Choose from {sorted(schedulers.keys())}.")
@@ -321,9 +330,9 @@ def parse_args():
     parser.add_argument(
         "--scheduler",
         type=str,
-        default="ddpm",
-        choices=["ddpm", "ddim", "dpmpp"],
-        help="Scheduler used for the diffusion prior.",
+        default="dpmpp",
+        choices=["ddpm", "ddim", "dpmpp", "euler", "euler-ancestral"],
+        help="Scheduler used for the diffusion prior (dpmpp is a strong modern default).",
     )
     parser.add_argument(
         "--save-dir",
