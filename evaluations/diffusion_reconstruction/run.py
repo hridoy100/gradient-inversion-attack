@@ -32,7 +32,7 @@ if not hasattr(torch, "xpu"):
     torch.xpu = _DummyXPU()  # type: ignore[attr-defined]
 
 try:
-from diffusers import (
+    from diffusers import (
     DDPMScheduler,
     DDIMScheduler,
     DPMSolverMultistepScheduler,
