@@ -206,7 +206,13 @@ def diffusion_guided_reconstruction(
             noisy_latent = current.detach()
             noise_pred = diffusion_model(noisy_latent, timestep).sample
             diffusion_out = scheduler.step(noise_pred, timestep, noisy_latent)
-            prior_loss = F.mse_loss(noisy_latent, diffusion_out.pred_original_sample).item()
+            # Some schedulers (e.g., DDPM/UniPC) expose pred_original_sample; others (e.g., DPM++) do not.
+            if hasattr(diffusion_out, "pred_original_sample") and diffusion_out.pred_original_sample is not None:
+                prior_loss = F.mse_loss(noisy_latent, diffusion_out.pred_original_sample).item()
+            elif hasattr(diffusion_out, "prev_sample") and diffusion_out.prev_sample is not None:
+                prior_loss = F.mse_loss(noisy_latent, diffusion_out.prev_sample).item()
+            else:
+                prior_loss = 0.0
             current = diffusion_out.prev_sample
 
         if step % log_every == 0 or step == len(scheduler.timesteps) - 1:
