@@ -7,6 +7,7 @@ prior (from Hugging Face diffusers) to denoise intermediate iterates. It
 saves reconstructed images, loss traces, and quality metrics per client.
 """
 import argparse
+import csv
 import json
 import math
 import sys
@@ -516,6 +517,8 @@ def main():
     run_dir = Path(args.save_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    metrics_rows = []
+
     meta = {
         "arch": args.arch,
         "pretrained": args.pretrained,
@@ -588,6 +591,17 @@ def main():
             metrics = compute_metrics(
                 visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu
             )
+            start = client.client_id * args.samples_per_client
+            end = start + args.samples_per_client
+            metrics_rows.append(
+                {
+                    "round_id": int(args.round_id),
+                    "mode": "per-client",
+                    "client_id": int(client.client_id),
+                    "dataset_indices": ",".join(str(i) for i in indices[start:end]),
+                    **{k: float(v) for k, v in metrics.items()},
+                }
+            )
             save_client_outputs(
                 run_dir,
                 client_id=client.client_id,
@@ -646,6 +660,15 @@ def main():
             all_labels,
             recovered_labels.detach().cpu(),
         )
+        metrics_rows.append(
+            {
+                "round_id": int(args.round_id),
+                "mode": "aggregated",
+                "client_id": "",
+                "dataset_indices": ",".join(str(i) for i in indices),
+                **{k: float(v) for k, v in metrics.items()},
+            }
+        )
 
         agg_dir = run_dir / "aggregated"
         agg_dir.mkdir(parents=True, exist_ok=True)
@@ -656,6 +679,24 @@ def main():
         (agg_dir / "metrics_aggregated.json").write_text(json.dumps(metrics, indent=2))
         (agg_dir / "loss_aggregated.json").write_text(json.dumps(history, indent=2))
         print(f"Aggregated reconstruction saved with metrics {metrics}")
+
+    if metrics_rows:
+        with (run_dir / "metrics.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "round_id",
+                    "mode",
+                    "client_id",
+                    "dataset_indices",
+                    "mse",
+                    "psnr",
+                    "feature_similarity",
+                    "class_accuracy",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(metrics_rows)
 
 
 if __name__ == "__main__":

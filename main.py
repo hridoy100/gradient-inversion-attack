@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 import argparse
+import csv
 import json
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple, Dict, Any
 
 import matplotlib.pyplot as plt
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import datasets, transforms
 
@@ -273,11 +275,75 @@ def save_reconstructions(
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
+    def _to_01(x: torch.Tensor) -> torch.Tensor:
+        x = x.detach().cpu()
+        if denormalize:
+            x = denormalize(x)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
+        return torch.clamp(x, 0.0, 1.0)
+
+    def _mean_std(t: torch.Tensor) -> Dict[str, float]:
+        return {"mean": float(t.mean().item()), "std": float(t.std(unbiased=False).item())}
+
+    def _metrics_rows(
+        *,
+        mode: str,
+        client_id: Optional[int],
+        original: torch.Tensor,
+        reconstructed: torch.Tensor,
+        labels: torch.Tensor,
+        recovered_labels: torch.Tensor,
+        dataset_indices: List[int],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        original_01 = _to_01(original)
+        reconstructed_01 = _to_01(reconstructed)
+        diff = reconstructed_01 - original_01
+        mse_per = (diff * diff).flatten(1).mean(dim=1)
+        psnr_per = 10.0 * torch.log10(1.0 / torch.clamp(mse_per, min=1e-8))
+        cos_per = F.cosine_similarity(original_01.flatten(1), reconstructed_01.flatten(1), dim=1)
+        pred = recovered_labels.detach().cpu().argmax(dim=1)
+        labels_cpu = labels.detach().cpu()
+        correct = (pred == labels_cpu).to(torch.float32)
+
+        rows: List[Dict[str, Any]] = []
+        for i in range(original_01.size(0)):
+            rows.append(
+                {
+                    "mode": mode,
+                    "client_id": "" if client_id is None else int(client_id),
+                    "sample_idx": int(i),
+                    "dataset_idx": int(dataset_indices[i]),
+                    "mse": float(mse_per[i].item()),
+                    "psnr": float(psnr_per[i].item()),
+                    "feature_similarity": float(cos_per[i].item()),
+                    "true_label": int(labels_cpu[i].item()),
+                    "pred_label": int(pred[i].item()),
+                    "correct": int(correct[i].item()),
+                }
+            )
+
+        summary: Dict[str, Any] = {
+            "count": int(original_01.size(0)),
+            "mse": _mean_std(mse_per),
+            "psnr": _mean_std(psnr_per),
+            "feature_similarity": _mean_std(cos_per),
+            "class_accuracy": _mean_std(correct),
+        }
+        return rows, summary
+
+    metrics_rows: List[Dict[str, Any]] = []
+    metrics_summary: Dict[str, Any] = {"per_client": {}, "aggregated": None}
+
     for result in per_client_results:
         client = result["client"]
         recovered_data = result["recovered_data"]
+        recovered_labels = result.get("recovered_labels")
         history = result["history"]
         client_dir = run_dir / f"client_{client.client_id}"
+        if recovered_data is None:
+            client_dir.mkdir(parents=True, exist_ok=True)
+            (client_dir / "error.txt").write_text("Reconstruction failed (no recovered_data). Try more restarts or smaller init-scale.")
+            continue
         for idx in range(recovered_data.size(0)):
             save_image(client.data[idx], client_dir / f"original_{idx}.png", denormalize)
             save_image(recovered_data[idx], client_dir / f"reconstructed_{idx}.png")
@@ -286,10 +352,30 @@ def save_reconstructions(
             for entry in history:
                 save_image(entry["data"][0], hist_dir / f"iter_{entry['iteration']}.png", denormalize)
 
+        if recovered_labels is not None:
+            start = client.client_id * args.samples_per_client
+            end = start + args.samples_per_client
+            rows, summary = _metrics_rows(
+                mode="per-client",
+                client_id=client.client_id,
+                original=client.data,
+                reconstructed=recovered_data,
+                labels=client.labels,
+                recovered_labels=recovered_labels,
+                dataset_indices=indices[start:end],
+            )
+            metrics_rows.extend(rows)
+            metrics_summary["per_client"][str(client.client_id)] = summary
+
     if aggregated_result and all_real_data is not None:
         agg_dir = run_dir / "aggregated"
         recovered_data = aggregated_result["recovered_data"]
         history = aggregated_result["history"]
+        recovered_labels = aggregated_result.get("recovered_labels")
+        if recovered_data is None:
+            agg_dir.mkdir(parents=True, exist_ok=True)
+            (agg_dir / "error.txt").write_text("Reconstruction failed (no recovered_data). Try more restarts or smaller init-scale.")
+            return
         total_samples = min(recovered_data.size(0), all_real_data.size(0))
         for idx in range(total_samples):
             save_image(all_real_data[idx], agg_dir / f"original_{idx}.png", denormalize)
@@ -298,6 +384,41 @@ def save_reconstructions(
             hist_dir = agg_dir / "history"
             for entry in history:
                 save_image(entry["data"][0], hist_dir / f"iter_{entry['iteration']}.png", denormalize)
+
+        if recovered_labels is not None:
+            labels = torch.cat([client.labels for client in clients], dim=0)[:total_samples]
+            rows, summary = _metrics_rows(
+                mode="aggregated",
+                client_id=None,
+                original=all_real_data[:total_samples],
+                reconstructed=recovered_data[:total_samples],
+                labels=labels,
+                recovered_labels=recovered_labels[:total_samples],
+                dataset_indices=indices[:total_samples],
+            )
+            metrics_rows.extend(rows)
+            metrics_summary["aggregated"] = summary
+
+    if metrics_rows:
+        (run_dir / "metrics_summary.json").write_text(json.dumps(metrics_summary, indent=2))
+        with (run_dir / "metrics.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "mode",
+                    "client_id",
+                    "sample_idx",
+                    "dataset_idx",
+                    "mse",
+                    "psnr",
+                    "feature_similarity",
+                    "true_label",
+                    "pred_label",
+                    "correct",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(metrics_rows)
 
 
 def main():

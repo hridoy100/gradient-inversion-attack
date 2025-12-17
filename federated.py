@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple
@@ -155,8 +156,12 @@ def gradient_inversion(
                     }
                 )
 
-        final_loss = last_loss_val.item() if last_loss_val is not None else float("inf")
-        if final_loss < best["loss"]:
+        final_loss = float(last_loss_val.item()) if last_loss_val is not None else float("inf")
+        if not math.isfinite(final_loss):
+            final_loss = float("inf")
+        # If we never see a finite loss (e.g., numerical issues), still return the last iterate
+        # rather than None so downstream saving/visualization doesn't crash.
+        if best["data"] is None or final_loss < best["loss"]:
             with torch.no_grad():
                 best["loss"] = final_loss
                 best["data"] = dummy_data.detach().clone()
