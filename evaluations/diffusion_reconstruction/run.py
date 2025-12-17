@@ -204,7 +204,9 @@ def diffusion_guided_reconstruction(
 
         with torch.no_grad():
             noisy_latent = current.detach()
-            noise_pred = diffusion_model(noisy_latent, timestep).sample
+            # Some schedulers expect inputs to be scaled before step.
+            model_latent = scheduler.scale_model_input(noisy_latent, timestep) if hasattr(scheduler, "scale_model_input") else noisy_latent
+            noise_pred = diffusion_model(model_latent, timestep).sample
             diffusion_out = scheduler.step(noise_pred, timestep, noisy_latent)
             # Some schedulers (e.g., DDPM/UniPC) expose pred_original_sample; others (e.g., DPM++) do not.
             if hasattr(diffusion_out, "pred_original_sample") and diffusion_out.pred_original_sample is not None:
