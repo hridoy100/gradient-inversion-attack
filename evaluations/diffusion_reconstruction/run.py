@@ -179,6 +179,7 @@ def diffusion_guided_reconstruction(
     label_opt = torch.optim.Adam([label_logits], lr=label_lr)
 
     history = []
+    best = {"loss": float("inf"), "data": None, "labels": None}
     total_steps = len(scheduler.timesteps)
     for step, timestep in enumerate(scheduler.timesteps):
         # Cosine-ish decay to allow coarse steps early and fine steps late.
@@ -227,10 +228,17 @@ def diffusion_guided_reconstruction(
                     "tv_loss": float(tv_loss.item()) if tv_weight > 0 else 0.0,
                 }
             )
+        # Track best iterate by total_loss to avoid late divergence.
+        if total_loss.item() < best["loss"]:
+            best["loss"] = float(total_loss.item())
+            best["data"] = current.detach().clone()
+            best["labels"] = label_logits.detach().clone()
 
     with torch.no_grad():
-        recovered_data = torch.clamp((current + 1.0) / 2.0, 0.0, 1.0)
-        recovered_labels = F.softmax(label_logits.detach(), dim=-1)
+        data_final = best["data"] if best["data"] is not None else current
+        labels_final = best["labels"] if best["labels"] is not None else label_logits
+        recovered_data = torch.clamp((data_final + 1.0) / 2.0, 0.0, 1.0)
+        recovered_labels = F.softmax(labels_final, dim=-1)
     return recovered_data, recovered_labels, history
 
 
