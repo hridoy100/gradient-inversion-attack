@@ -32,14 +32,14 @@ if not hasattr(torch, "xpu"):
     torch.xpu = _DummyXPU()  # type: ignore[attr-defined]
 
 try:
-    from diffusers import DDPMScheduler, UNet2DModel
+from diffusers import DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler, UNet2DModel
 except ImportError as exc:  # pragma: no cover - dependency message only
     raise ImportError(
         "diffusers is required for diffusion-guided reconstruction. "
         "Install it with `pip install diffusers`."
     ) from exc
 
-from federated import FederatedClient
+from federated import FederatedClient, FederatedServer
 from models.vision_new import CIFAR100_MEAN, CIFAR100_STD, MODEL_BUILDERS, build_model, default_transform
 from utils import cross_entropy_for_onehot
 
@@ -263,10 +263,18 @@ def save_client_outputs(
     )
 
 
-def load_diffusion_prior(device: str):
-    """Load a lightweight CIFAR-scale diffusion prior."""
-    repo_id = "google/ddpm-cifar10-32"
-    scheduler = DDPMScheduler.from_pretrained(repo_id)
+def load_diffusion_prior(device: str, repo_id: str = "google/ddpm-cifar10-32", scheduler_type: str = "ddpm"):
+    """Load a CIFAR-scale diffusion prior with a configurable scheduler."""
+    schedulers = {
+        "ddpm": DDPMScheduler,
+        "ddim": DDIMScheduler,
+        "dpmpp": DPMSolverMultistepScheduler,
+    }
+    if scheduler_type not in schedulers:
+        raise ValueError(f"Unsupported scheduler '{scheduler_type}'. Choose from {sorted(schedulers.keys())}.")
+
+    scheduler_cls = schedulers[scheduler_type]
+    scheduler = scheduler_cls.from_pretrained(repo_id)
     diffusion_model = UNet2DModel.from_pretrained(repo_id).to(device)
     diffusion_model.eval()
     return diffusion_model, scheduler
@@ -289,6 +297,12 @@ def parse_args():
     parser.add_argument("--num-clients", type=int, default=1, help="Number of federated clients.")
     parser.add_argument("--samples-per-client", type=int, default=1, help="Samples held by each client.")
     parser.add_argument(
+        "--reconstruct-mode",
+        choices=["per-client", "aggregated", "both"],
+        default="per-client",
+        help="Reconstruct per-client gradients, aggregated gradients, or both.",
+    )
+    parser.add_argument(
         "--diffusion-steps", type=int, default=50, help="Number of denoising steps for the diffusion prior."
     )
     parser.add_argument("--match-steps", type=int, default=5, help="Gradient updates per diffusion denoise step.")
@@ -298,6 +312,19 @@ def parse_args():
     parser.add_argument("--label-lr-end", type=float, default=0.01, help="Final step size for label logit updates.")
     parser.add_argument("--tv-weight", type=float, default=0.0, help="Total-variation weight on reconstructed images.")
     parser.add_argument("--log-every", type=int, default=20, help="Store loss entries every N diffusion steps.")
+    parser.add_argument(
+        "--diffusion-model",
+        type=str,
+        default="google/ddpm-cifar10-32",
+        help="Diffusion prior repo id (Hugging Face diffusers UNet2DModel).",
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="ddpm",
+        choices=["ddpm", "ddim", "dpmpp"],
+        help="Scheduler used for the diffusion prior.",
+    )
     parser.add_argument(
         "--save-dir",
         type=str,
@@ -311,6 +338,22 @@ def parse_args():
         type=str,
         default=None,
         help="Comma separated CIFAR100 indices (must equal num_clients * samples_per_client).",
+    )
+    parser.add_argument(
+        "--normalize-gradients",
+        action="store_true",
+        help="L2-normalize client gradients before aggregation.",
+    )
+    parser.add_argument(
+        "--apply-agg-step",
+        action="store_true",
+        help="Apply one gradient step on the model using aggregated gradients before inversion.",
+    )
+    parser.add_argument(
+        "--agg-lr",
+        type=float,
+        default=0.1,
+        help="Learning rate for the aggregated gradient step (used with --apply-agg-step).",
     )
     parser.add_argument(
         "--data-root",
@@ -351,7 +394,10 @@ def main():
         model.eval()
 
     clients = build_clients(dataset, indices, args.num_clients, args.samples_per_client, device, num_classes)
-    diffusion_model, scheduler = load_diffusion_prior(device)
+    diffusion_model, scheduler = load_diffusion_prior(
+        device, repo_id=args.diffusion_model, scheduler_type=args.scheduler
+    )
+    server = FederatedServer(model, device=device, num_classes=num_classes)
 
     run_dir = Path(args.save_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -372,18 +418,80 @@ def main():
         "tv_weight": args.tv_weight,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "checkpoint": args.checkpoint,
+        "reconstruct_mode": args.reconstruct_mode,
+        "normalize_gradients": args.normalize_gradients,
+        "apply_agg_step": args.apply_agg_step,
+        "agg_lr": args.agg_lr,
+        "diffusion_model": args.diffusion_model,
+        "scheduler": args.scheduler,
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
+    client_gradients = []
     for client in clients:
         grads, loss = client.compute_gradients(model)
-        target_gradients = [g.to(device) for g in grads]
+        grads = [g.to(device) for g in grads]
+        client_gradients.append(grads)
         print(f"Client {client.client_id}: local loss={loss:.4f}")
 
+    if args.reconstruct_mode in ("per-client", "both"):
+        for client, grads in zip(clients, client_gradients):
+            recovered_data, recovered_labels, history = diffusion_guided_reconstruction(
+                model=model,
+                target_gradients=grads,
+                data_shape=client.data.shape,
+                num_classes=num_classes,
+                arch=args.arch,
+                diffusion_model=diffusion_model,
+                scheduler=scheduler,
+                diffusion_steps=args.diffusion_steps,
+                match_lr=args.match_lr,
+                match_steps=args.match_steps,
+                label_lr=args.label_lr,
+                tv_weight=args.tv_weight,
+                log_every=args.log_every,
+            )
+
+            original_batch = client.data.detach().cpu()
+            reconstructed_batch = recovered_data.detach().cpu()
+            labels_cpu = client.labels.detach().cpu()
+            recovered_labels_cpu = recovered_labels.detach().cpu()
+            visual_original = original_batch
+            if denormalize:
+                visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
+            visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
+
+            metrics = compute_metrics(
+                visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu
+            )
+            save_client_outputs(
+                run_dir,
+                client_id=client.client_id,
+                round_id=args.round_id,
+                original_batch=visual_original,
+                reconstructed_batch=visual_reconstructed,
+                denormalize=None,
+                metrics=metrics,
+                history=history,
+            )
+            print(f"Client {client.client_id}: reconstruction saved with metrics {metrics}")
+
+    if args.reconstruct_mode in ("aggregated", "both"):
+        aggregated_gradients = server.aggregate_gradients(
+            client_gradients, normalize=args.normalize_gradients
+        )
+        print(f"Aggregated gradients collected. normalize_gradients={args.normalize_gradients}")
+
+        if args.apply_agg_step:
+            print(f"Applying aggregated gradient step to model with lr={args.agg_lr}")
+            server.apply_gradient_step(aggregated_gradients, lr=args.agg_lr)
+
+        total_samples = args.num_clients * args.samples_per_client
+        data_shape = torch.Size((total_samples, *clients[0].data.shape[1:]))
         recovered_data, recovered_labels, history = diffusion_guided_reconstruction(
             model=model,
-            target_gradients=target_gradients,
-            data_shape=client.data.shape,
+            target_gradients=aggregated_gradients,
+            data_shape=data_shape,
             num_classes=num_classes,
             arch=args.arch,
             diffusion_model=diffusion_model,
@@ -396,29 +504,29 @@ def main():
             log_every=args.log_every,
         )
 
-        original_batch = client.data.detach().cpu()
-        reconstructed_batch = recovered_data.detach().cpu()
-        labels_cpu = client.labels.detach().cpu()
-        recovered_labels_cpu = recovered_labels.detach().cpu()
-        visual_original = original_batch
+        all_original = torch.cat([client.data for client in clients], dim=0).detach().cpu()
+        all_labels = torch.cat([client.labels for client in clients], dim=0).detach().cpu()
+        all_reconstructed = torch.clamp(recovered_data.detach().cpu(), 0.0, 1.0)
+        visual_original = all_original
         if denormalize:
             visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
-        visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
 
         metrics = compute_metrics(
-            visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu
+            visual_original,
+            all_reconstructed,
+            all_labels,
+            recovered_labels.detach().cpu(),
         )
-        save_client_outputs(
-            run_dir,
-            client_id=client.client_id,
-            round_id=args.round_id,
-            original_batch=visual_original,
-            reconstructed_batch=visual_reconstructed,
-            denormalize=None,
-            metrics=metrics,
-            history=history,
-        )
-        print(f"Client {client.client_id}: reconstruction saved with metrics {metrics}")
+
+        agg_dir = run_dir / "aggregated"
+        agg_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(visual_original.size(0)):
+            save_image(visual_original[idx], agg_dir / f"original_{idx}.png", None)
+            save_image(all_reconstructed[idx], agg_dir / f"reconstructed_{idx}.png", None)
+
+        (agg_dir / "metrics_aggregated.json").write_text(json.dumps(metrics, indent=2))
+        (agg_dir / "loss_aggregated.json").write_text(json.dumps(history, indent=2))
+        print(f"Aggregated reconstruction saved with metrics {metrics}")
 
 
 if __name__ == "__main__":
