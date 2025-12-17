@@ -76,7 +76,7 @@ def main():
         for x, _ in loader:
             x = x.to(device)
             bsz = x.size(0)
-            t = torch.randint(0, scheduler.num_train_timesteps, (bsz,), device=device).long()
+            t = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,), device=device).long()
             noise = torch.randn_like(x)
             noisy = scheduler.add_noise(x, noise, t)
             pred = unet(noisy, t).sample
