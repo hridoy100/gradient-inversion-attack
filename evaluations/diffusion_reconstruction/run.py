@@ -32,7 +32,7 @@ if not hasattr(torch, "xpu"):
     torch.xpu = _DummyXPU()  # type: ignore[attr-defined]
 
 try:
-from diffusers import DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler, UNet2DModel
+    from diffusers import DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler, UNet2DModel
 except ImportError as exc:  # pragma: no cover - dependency message only
     raise ImportError(
         "diffusers is required for diffusion-guided reconstruction. "
