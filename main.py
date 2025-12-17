@@ -197,7 +197,7 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int, d
         history = result["history"]
 
         cols = samples_per_client
-        plt.figure(figsize=(2.5 * cols, 5))
+        base_fig = plt.figure(figsize=(2.5 * cols, 5))
         for idx in range(cols):
             plt.subplot(2, cols, idx + 1)
             plt.imshow(to_safe_pil(client.data[idx], denormalize))
@@ -210,14 +210,26 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int, d
             plt.axis("off")
 
         if history:
-            plt.figure(figsize=(3 * len(history), 3))
+            n = len(history)
+            fig, axes = plt.subplots(
+                1,
+                n,
+                figsize=(max(3 * n, 6), 3.6),
+                constrained_layout=True,
+                squeeze=False,
+            )
             for i, entry in enumerate(history):
-                plt.subplot(1, len(history), i + 1)
-                plt.imshow(to_safe_pil(entry["data"][0], denormalize))
-                plt.title(f"C{client.client_id} Iter {entry['iteration']}\nLoss {entry['loss']:.2f}")
-                plt.axis("off")
+                ax = axes[0][i]
+                ax.imshow(to_safe_pil(entry["data"][0], denormalize))
+                ax.set_title(
+                    f"C{client.client_id} Iter {entry['iteration']}\nLoss {entry['loss']:.2f}",
+                    fontsize=8,
+                    pad=4,
+                )
+                ax.title.set_wrap(True)
+                ax.axis("off")
 
-        plt.tight_layout()
+        base_fig.tight_layout()
 
 
 def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: torch.Tensor, history, denormalize=None):
@@ -226,7 +238,7 @@ def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: t
     cols = min(total_samples, 8)
     rows = 2
 
-    plt.figure(figsize=(2.5 * cols, 5))
+    base_fig = plt.figure(figsize=(2.5 * cols, 5))
     for idx in range(cols):
         plt.subplot(rows, cols, idx + 1)
         plt.imshow(to_safe_pil(all_real_data[idx], denormalize))
@@ -238,15 +250,27 @@ def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: t
         plt.title("Reconstructed")
         plt.axis("off")
 
-    if history:
-        plt.figure(figsize=(3 * len(history), 3))
-        for i, entry in enumerate(history):
-            plt.subplot(1, len(history), i + 1)
-            plt.imshow(to_safe_pil(entry["data"][0], denormalize))
-            plt.title(f"Aggregated Iter {entry['iteration']}\nLoss {entry['loss']:.2f}")
-            plt.axis("off")
+    base_fig.tight_layout()
 
-        plt.tight_layout()
+    if history:
+        n = len(history)
+        fig, axes = plt.subplots(
+            1,
+            n,
+            figsize=(max(3 * n, 6), 3.6),
+            constrained_layout=True,
+            squeeze=False,
+        )
+        for i, entry in enumerate(history):
+            ax = axes[0][i]
+            ax.imshow(to_safe_pil(entry["data"][0], denormalize))
+            ax.set_title(
+                f"Aggregated Iter {entry['iteration']}\nLoss {entry['loss']:.2f}",
+                fontsize=8,
+                pad=4,
+            )
+            ax.title.set_wrap(True)
+            ax.axis("off")
 
 
 def save_reconstructions(
