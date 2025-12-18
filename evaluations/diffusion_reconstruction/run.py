@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -617,7 +618,17 @@ def main():
         if args.deterministic:
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
-            torch.use_deterministic_algorithms(True)
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                if os.environ.get("CUBLAS_WORKSPACE_CONFIG"):
+                    torch.use_deterministic_algorithms(True)
+                else:
+                    print(
+                        "Warning: --deterministic requested, but CUBLAS_WORKSPACE_CONFIG is not set. "
+                        "Some CUDA ops may be nondeterministic. To enforce determinism, set "
+                        "CUBLAS_WORKSPACE_CONFIG=:4096:8 (or :16:8) before running."
+                    )
     print(f"Running diffusion-guided reconstruction on {device}")
 
     transform = default_transform(args.arch)

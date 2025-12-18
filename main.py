@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import textwrap
 import time
 from pathlib import Path
@@ -797,7 +798,19 @@ def main():
         if args.deterministic:
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
-            torch.use_deterministic_algorithms(True)
+            try:
+                # Prefer warn-only mode to avoid hard failures on CuBLAS ops unless the env is configured.
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                # Older PyTorch: require CuBLAS workspace config for strict determinism.
+                if os.environ.get("CUBLAS_WORKSPACE_CONFIG"):
+                    torch.use_deterministic_algorithms(True)
+                else:
+                    print(
+                        "Warning: --deterministic requested, but CUBLAS_WORKSPACE_CONFIG is not set. "
+                        "Some CUDA ops may be nondeterministic. To enforce determinism, set "
+                        "CUBLAS_WORKSPACE_CONFIG=:4096:8 (or :16:8) before running."
+                    )
     print(f"Running on {device}")
 
     dataset, num_classes, denormalize = build_dataset_and_transform(args)

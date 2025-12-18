@@ -30,7 +30,7 @@ python3 main.py --device cpu --reconstruct-mode aggregated --iterations 300 --re
 
 Key options:
 - `--device`: `auto` (default), `cpu`, or `cuda`.
-- `--cuda-stable`: stability mode for CUDA (disables TF32 + enables deterministic algorithms).
+- `--cuda-stable`: stability mode for CUDA (disables TF32 + enables deterministic settings).
 - `--dataset`: `cifar100` (default) or `tiny-imagenet`.
 - `--dataset-split`: `train` (default) or `val` (Tiny-ImageNet).
 - `--image-size`: input size used for Tiny-ImageNet transforms (default `64`).
@@ -57,6 +57,7 @@ Key options:
 - `--data-root`: dataset location. For CIFAR100 it is the torchvision download/cache root (defaults to `~/.torch`). For Tiny-ImageNet it should contain `tiny-imagenet-200/`.
 
 Notes:
+- If you enable `--deterministic` on CUDA and your PyTorch build requires it, set `CUBLAS_WORKSPACE_CONFIG=:4096:8` (or `:16:8`) in your job environment for strict determinism.
 - Aggregated reconstruction matches batch gradients, which are permutation-invariant. The script aligns reconstructed samples to real samples for visualization/metrics, but perfect 1:1 ordering is not guaranteed in general.
 - Tiny-ImageNet is not downloaded automatically. Download/extract it separately and pass `--data-root` accordingly.
 
