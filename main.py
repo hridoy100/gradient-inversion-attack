@@ -181,6 +181,13 @@ def _wrap_title(title: str, width: int = 22) -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description="Federated Deep Leakage from Gradients.")
     parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device to run on. 'auto' picks CUDA if available.",
+    )
+    parser.add_argument(
         "--arch",
         type=str,
         default="lenet",
@@ -624,7 +631,14 @@ def save_reconstructions(
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested --device cuda but CUDA is not available.")
+        device = "cuda"
+    else:
+        device = "cpu"
     print(f"Running on {device}")
 
     transform = default_transform(args.arch)
