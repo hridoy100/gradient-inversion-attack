@@ -80,6 +80,84 @@ def save_image(tensor: torch.Tensor, path: Path, denormalize=None):
     to_safe_pil(tensor, denormalize).save(path)
 
 
+def _linear_sum_assignment(cost: List[List[float]]) -> List[int]:
+    """Return column indices assigned to each row (Hungarian algorithm, O(n^3))."""
+    n = len(cost)
+    if n == 0:
+        return []
+    m = len(cost[0])
+    if any(len(row) != m for row in cost):
+        raise ValueError("Cost matrix must be rectangular.")
+    if n != m:
+        raise ValueError("Only square cost matrices are supported.")
+
+    u = [0.0] * (n + 1)
+    v = [0.0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = 0
+            for j in range(1, n + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(0, n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignment = [0] * n
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def align_reconstruction_to_original(
+    original_01: torch.Tensor,
+    reconstructed_01: torch.Tensor,
+    recovered_labels: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Align reconstructed batch order to match original batch order (batch gradient is permutation-invariant)."""
+    n = min(original_01.size(0), reconstructed_01.size(0))
+    if n <= 1:
+        return reconstructed_01, recovered_labels
+
+    original_flat = original_01[:n].detach().cpu().flatten(1)
+    recon_flat = reconstructed_01[:n].detach().cpu().flatten(1)
+    diff = original_flat[:, None, :] - recon_flat[None, :, :]
+    cost = (diff * diff).mean(dim=-1)
+    perm = _linear_sum_assignment(cost.tolist())
+    perm_t = torch.as_tensor(perm, device=reconstructed_01.device, dtype=torch.long)
+    return reconstructed_01.index_select(0, perm_t), recovered_labels.index_select(0, perm_t)
+
+
 def pick_indices(total_samples: int, dataset_size: int, seed: int, client_indices: str = None) -> List[int]:
     """Parse/produce dataset indices for each client sample."""
     if client_indices:
@@ -588,6 +666,9 @@ def main():
                 visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
             visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
 
+            visual_reconstructed, recovered_labels_cpu = align_reconstruction_to_original(
+                visual_original, visual_reconstructed, recovered_labels_cpu
+            )
             metrics = compute_metrics(
                 visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu
             )
@@ -654,11 +735,15 @@ def main():
         if denormalize:
             visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
 
+        recovered_labels_cpu = recovered_labels.detach().cpu()
+        all_reconstructed, recovered_labels_cpu = align_reconstruction_to_original(
+            visual_original, all_reconstructed, recovered_labels_cpu
+        )
         metrics = compute_metrics(
             visual_original,
             all_reconstructed,
             all_labels,
-            recovered_labels.detach().cpu(),
+            recovered_labels_cpu,
         )
         metrics_rows.append(
             {

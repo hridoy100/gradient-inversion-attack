@@ -79,5 +79,13 @@ python3 evaluations/diffusion_reconstruction/run.py --num-clients 1 --samples-pe
 ```
 Outputs (images, loss traces, metrics) are stored under a timestamped subfolder of `--save-dir`.
 
+## LaTeX metrics table
+Create the paper-ready table from a `main.py` run directory (and optionally a diffusion run directory):
+```
+python3 scripts/make_metrics_table.py \
+  --dlg-run outputs/reconstructions/run_YYYYMMDD_HHMMSS \
+  --diffusion-run outputs/diffusion_dlg/run_YYYYMMDD_HHMMSS
+```
+
 ## License
 MIT; see [LICENSE](LICENSE).
