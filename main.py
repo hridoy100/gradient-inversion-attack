@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -11,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import datasets, transforms
+from torchvision.utils import make_grid
 
 from federated import FederatedClient, FederatedServer
 from models.vision_new import CIFAR100_MEAN, CIFAR100_STD, MODEL_BUILDERS, build_model, default_transform
@@ -24,6 +26,37 @@ def to_safe_pil(img_tensor: torch.Tensor, denormalize=None) -> Image.Image:
     img_tensor = torch.nan_to_num(img_tensor, nan=0.0, posinf=1.0, neginf=0.0)
     img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
     return transforms.ToPILImage()(img_tensor)
+
+
+def to_safe_01(img_tensor: torch.Tensor, denormalize=None) -> torch.Tensor:
+    """Convert tensor to [0, 1] space for metrics/matching."""
+    img_tensor = img_tensor.detach().cpu()
+    if denormalize:
+        img_tensor = denormalize(img_tensor)
+    img_tensor = torch.nan_to_num(img_tensor, nan=0.0, posinf=1.0, neginf=0.0)
+    return torch.clamp(img_tensor, 0.0, 1.0)
+
+
+def to_safe_grid_pil(
+    img_batch: torch.Tensor,
+    denormalize=None,
+    max_cols: int = 8,
+    padding: int = 2,
+    pad_value: float = 1.0,
+) -> Image.Image:
+    """Convert a (N, C, H, W) batch into a tiled PIL image for visualization."""
+    if img_batch.dim() == 3:
+        img_batch = img_batch.unsqueeze(0)
+    if img_batch.dim() != 4:
+        raise ValueError(f"Expected image batch of shape (N,C,H,W) or (C,H,W), got {tuple(img_batch.shape)}")
+    img_batch = img_batch.detach().cpu()
+    if denormalize:
+        img_batch = denormalize(img_batch)
+    img_batch = torch.nan_to_num(img_batch, nan=0.0, posinf=1.0, neginf=0.0)
+    img_batch = torch.clamp(img_batch, 0.0, 1.0)
+    nrow = max(1, int(max_cols))
+    grid = make_grid(img_batch, nrow=nrow, padding=padding, pad_value=pad_value)
+    return transforms.ToPILImage()(grid)
 
 
 def build_denormalize(arch: str):
@@ -42,6 +75,102 @@ def build_denormalize(arch: str):
 def save_image(tensor: torch.Tensor, path: Path, denormalize=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     to_safe_pil(tensor, denormalize).save(path)
+
+
+def save_grid_image(batch_tensor: torch.Tensor, path: Path, denormalize=None, max_cols: int = 8):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    to_safe_grid_pil(batch_tensor, denormalize=denormalize, max_cols=max_cols).save(path)
+
+
+def _linear_sum_assignment(cost: List[List[float]]) -> List[int]:
+    """Return column indices assigned to each row (Hungarian algorithm, O(n^3))."""
+    n = len(cost)
+    if n == 0:
+        return []
+    m = len(cost[0])
+    if any(len(row) != m for row in cost):
+        raise ValueError("Cost matrix must be rectangular.")
+    if n != m:
+        raise ValueError("Only square cost matrices are supported.")
+
+    u = [0.0] * (n + 1)
+    v = [0.0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = 0
+            for j in range(1, n + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(0, n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignment = [0] * n
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def align_reconstruction_to_original(
+    original: torch.Tensor,
+    reconstructed: torch.Tensor,
+    recovered_labels: Optional[torch.Tensor],
+    history: Optional[list],
+    denormalize=None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[list]]:
+    """Align reconstructed batch order to match original batch order (batch gradient is permutation-invariant)."""
+    if reconstructed is None:
+        return reconstructed, recovered_labels, history
+
+    n = min(original.size(0), reconstructed.size(0))
+    if n <= 1:
+        return reconstructed, recovered_labels, history
+
+    original_01 = to_safe_01(original[:n], denormalize).flatten(1)
+    reconstructed_01 = to_safe_01(reconstructed[:n], denormalize).flatten(1)
+    diff = original_01[:, None, :] - reconstructed_01[None, :, :]
+    cost_tensor = (diff * diff).mean(dim=-1)
+    perm = _linear_sum_assignment(cost_tensor.tolist())
+    perm_t = torch.as_tensor(perm, device=reconstructed.device, dtype=torch.long)
+
+    reconstructed = reconstructed.index_select(0, perm_t)
+    if recovered_labels is not None:
+        recovered_labels = recovered_labels.index_select(0, perm_t)
+    if history:
+        for entry in history:
+            if "data" in entry and isinstance(entry["data"], torch.Tensor) and entry["data"].dim() == 4:
+                entry["data"] = entry["data"].index_select(0, perm_t.to(entry["data"].device))
+    return reconstructed, recovered_labels, history
 
 
 def parse_args():
@@ -205,24 +334,27 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int, d
             plt.axis("off")
 
             plt.subplot(2, cols, idx + 1 + cols)
-            plt.imshow(to_safe_pil(recovered_data[idx]))
+            plt.imshow(to_safe_pil(recovered_data[idx], denormalize))
             plt.title("Reconstructed")
             plt.axis("off")
 
         if history:
             n = len(history)
+            grid_cols = min(cols, 8)
+            grid_rows = int(math.ceil(cols / grid_cols)) if cols else 1
+            fig_h = max(3.6, 1.7 * grid_rows + 1.2)
             fig, axes = plt.subplots(
                 1,
                 n,
-                figsize=(max(3 * n, 6), 3.6),
+                figsize=(max(3 * n, 6), fig_h),
                 constrained_layout=True,
                 squeeze=False,
             )
             for i, entry in enumerate(history):
                 ax = axes[0][i]
-                ax.imshow(to_safe_pil(entry["data"][0], denormalize))
+                ax.imshow(to_safe_grid_pil(entry["data"], denormalize, max_cols=grid_cols))
                 ax.set_title(
-                    f"C{client.client_id} Iter {entry['iteration']}\nLoss {entry['loss']:.2f}",
+                    f"C{client.client_id} Iter {entry['iteration']}\nGradLoss {entry['loss']:.2f}",
                     fontsize=8,
                     pad=4,
                 )
@@ -232,7 +364,14 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int, d
         base_fig.tight_layout()
 
 
-def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: torch.Tensor, history, denormalize=None):
+def visualize_aggregated_recovery(
+    all_real_data: torch.Tensor,
+    recovered_data: torch.Tensor,
+    history,
+    num_clients: int,
+    samples_per_client: int,
+    denormalize=None,
+):
     """Plot aggregated reconstruction against the stacked real data."""
     total_samples = min(recovered_data.size(0), all_real_data.size(0))
     cols = min(total_samples, 8)
@@ -246,31 +385,47 @@ def visualize_aggregated_recovery(all_real_data: torch.Tensor, recovered_data: t
         plt.axis("off")
 
         plt.subplot(rows, cols, idx + 1 + cols)
-        plt.imshow(to_safe_pil(recovered_data[idx]))
+        plt.imshow(to_safe_pil(recovered_data[idx], denormalize))
         plt.title("Reconstructed")
         plt.axis("off")
 
     base_fig.tight_layout()
 
     if history:
-        n = len(history)
-        fig, axes = plt.subplots(
-            1,
-            n,
-            figsize=(max(3 * n, 6), 3.6),
-            constrained_layout=True,
-            squeeze=False,
-        )
-        for i, entry in enumerate(history):
-            ax = axes[0][i]
-            ax.imshow(to_safe_pil(entry["data"][0], denormalize))
-            ax.set_title(
-                f"Aggregated Iter {entry['iteration']}\nLoss {entry['loss']:.2f}",
-                fontsize=8,
-                pad=4,
+        # Show aggregated iteration history in separate windows per client, mirroring per-client view.
+        for client_id in range(num_clients):
+            start = client_id * samples_per_client
+            end = min(start + samples_per_client, total_samples)
+            if start >= total_samples:
+                break
+            n = len(history)
+            grid_cols = min(end - start, 8) if end > start else 1
+            grid_rows = int(math.ceil((end - start) / grid_cols)) if end > start else 1
+            fig_h = max(3.6, 1.7 * grid_rows + 1.2)
+            fig, axes = plt.subplots(
+                1,
+                n,
+                figsize=(max(3 * n, 6), fig_h),
+                constrained_layout=True,
+                squeeze=False,
             )
-            ax.title.set_wrap(True)
-            ax.axis("off")
+            for i, entry in enumerate(history):
+                ax = axes[0][i]
+                batch = entry["data"][start:end]
+                ax.imshow(to_safe_grid_pil(batch, denormalize, max_cols=grid_cols))
+                mse = float(
+                    F.mse_loss(
+                        to_safe_01(batch, denormalize),
+                        to_safe_01(all_real_data[start:end], denormalize),
+                    ).item()
+                )
+                ax.set_title(
+                    f"Agg C{client_id} Iter {entry['iteration']}\nGradLoss {entry['loss']:.2f}  MSE {mse:.4f}",
+                    fontsize=8,
+                    pad=4,
+                )
+                ax.title.set_wrap(True)
+                ax.axis("off")
 
 
 def save_reconstructions(
@@ -370,11 +525,16 @@ def save_reconstructions(
             continue
         for idx in range(recovered_data.size(0)):
             save_image(client.data[idx], client_dir / f"original_{idx}.png", denormalize)
-            save_image(recovered_data[idx], client_dir / f"reconstructed_{idx}.png")
+            save_image(recovered_data[idx], client_dir / f"reconstructed_{idx}.png", denormalize)
         if history:
             hist_dir = client_dir / "history"
             for entry in history:
-                save_image(entry["data"][0], hist_dir / f"iter_{entry['iteration']}.png", denormalize)
+                save_grid_image(
+                    entry["data"],
+                    hist_dir / f"iter_{entry['iteration']}.png",
+                    denormalize=denormalize,
+                    max_cols=min(recovered_data.size(0), 8),
+                )
 
         if recovered_labels is not None:
             start = client.client_id * args.samples_per_client
@@ -403,11 +563,21 @@ def save_reconstructions(
         total_samples = min(recovered_data.size(0), all_real_data.size(0))
         for idx in range(total_samples):
             save_image(all_real_data[idx], agg_dir / f"original_{idx}.png", denormalize)
-            save_image(recovered_data[idx], agg_dir / f"reconstructed_{idx}.png")
+            save_image(recovered_data[idx], agg_dir / f"reconstructed_{idx}.png", denormalize)
         if history:
             hist_dir = agg_dir / "history"
             for entry in history:
-                save_image(entry["data"][0], hist_dir / f"iter_{entry['iteration']}.png", denormalize)
+                for client_id in range(args.num_clients):
+                    start = client_id * args.samples_per_client
+                    end = min(start + args.samples_per_client, total_samples)
+                    if start >= total_samples:
+                        break
+                    save_grid_image(
+                        entry["data"][start:end],
+                        hist_dir / f"client_{client_id}_iter_{entry['iteration']}.png",
+                        denormalize=denormalize,
+                        max_cols=min(end - start, 8),
+                    )
 
         if recovered_labels is not None:
             labels = torch.cat([client.labels for client in clients], dim=0)[:total_samples]
@@ -496,6 +666,9 @@ def main():
                 init_scale=args.init_scale,
                 progress=args.progress,
             )
+            recovered_data, recovered_labels, history = align_reconstruction_to_original(
+                client.data, recovered_data, recovered_labels, history, denormalize=denormalize
+            )
             per_client_results.append(
                 {
                     "client": client,
@@ -527,6 +700,10 @@ def main():
             init_scale=args.init_scale,
             progress=args.progress,
         )
+        all_real_data = torch.cat([client.data for client in clients], dim=0)
+        recovered_data, recovered_labels, history = align_reconstruction_to_original(
+            all_real_data, recovered_data, recovered_labels, history, denormalize=denormalize
+        )
         aggregated_result = {"recovered_data": recovered_data, "history": history, "recovered_labels": recovered_labels}
         print("Aggregated reconstruction complete.")
 
@@ -550,7 +727,14 @@ def main():
     if per_client_results:
         visualize_per_client_recovery(per_client_results, args.samples_per_client, denormalize)
     if aggregated_result:
-        visualize_aggregated_recovery(all_real_data, aggregated_result["recovered_data"], aggregated_result["history"], denormalize)
+        visualize_aggregated_recovery(
+            all_real_data,
+            aggregated_result["recovered_data"],
+            aggregated_result["history"],
+            num_clients=args.num_clients,
+            samples_per_client=args.samples_per_client,
+            denormalize=denormalize,
+        )
 
     plt.show()
 

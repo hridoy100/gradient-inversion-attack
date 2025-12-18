@@ -117,12 +117,12 @@ def gradient_inversion(
 
         history = []
 
-        def gradient_match_loss():
+        def gradient_match_loss(create_graph: bool):
             """Compute squared distance between dummy and target gradients."""
             pred = model(dummy_data)
             dummy_onehot = F.softmax(dummy_label, dim=-1)
             dummy_loss = cross_entropy_for_onehot(pred, dummy_onehot)
-            dummy_dy_dx = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
+            dummy_dy_dx = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=create_graph)
             grad_diff = sum(((gx - gy) ** 2).sum() for gx, gy in zip(dummy_dy_dx, target_gradients))
 
             if tv_weight > 0:
@@ -140,23 +140,25 @@ def gradient_inversion(
         for iters in iterator:
             def closure():
                 optimizer.zero_grad()
-                loss = gradient_match_loss()
+                loss = gradient_match_loss(create_graph=True)
                 loss.backward()
                 return loss
 
             loss_val = optimizer.step(closure)
-            last_loss_val = loss_val
+            last_loss_val = loss_val.detach() if isinstance(loss_val, torch.Tensor) else None
 
             if iters % log_every == 0 or iters == iterations - 1:
+                loss_now = gradient_match_loss(create_graph=False).detach()
+                last_loss_val = loss_now
                 history.append(
                     {
                         "iteration": iters,
-                        "loss": loss_val.item(),
+                        "loss": float(loss_now.item()),
                         "data": dummy_data.detach().clone(),
                     }
                 )
 
-        final_loss = float(last_loss_val.item()) if last_loss_val is not None else float("inf")
+        final_loss = float(gradient_match_loss(create_graph=False).detach().item())
         if not math.isfinite(final_loss):
             final_loss = float("inf")
         # If we never see a finite loss (e.g., numerical issues), still return the last iterate
