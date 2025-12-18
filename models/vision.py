@@ -13,7 +13,7 @@ def weights_init(m):
         m.bias.data.uniform_(-0.5, 0.5)
         
 class LeNet(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes: int = 100):
         super(LeNet, self).__init__()
         act = nn.Sigmoid
         self.body = nn.Sequential(
@@ -24,12 +24,17 @@ class LeNet(nn.Module):
             nn.Conv2d(12, 12, kernel_size=5, padding=5//2, stride=1),
             act(),
         )
+        # Make the classifier input size invariant to the input resolution.
+        # For CIFAR32, the conv stack already yields 8x8; for larger inputs (e.g., 64x64),
+        # this adaptively pools to 8x8 so the FC layer shape remains stable.
+        self.pool = nn.AdaptiveAvgPool2d((8, 8))
         self.fc = nn.Sequential(
-            nn.Linear(768, 100)
+            nn.Linear(768, num_classes)
         )
         
     def forward(self, x):
         out = self.body(x)
+        out = self.pool(out)
         out = out.view(out.size(0), -1)
         # print(out.size())
         out = self.fc(out)
@@ -155,4 +160,3 @@ def ResNet101():
 
 def ResNet152():
     return ResNet(Bottleneck, [3,8,36,3])
-

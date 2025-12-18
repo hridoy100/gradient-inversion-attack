@@ -6,7 +6,7 @@ import math
 import textwrap
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Callable
 
 import matplotlib.pyplot as plt
 import torch
@@ -17,6 +17,10 @@ from torchvision.utils import make_grid
 
 from federated import FederatedClient, FederatedServer
 from models.vision_new import CIFAR100_MEAN, CIFAR100_STD, MODEL_BUILDERS, build_model, default_transform
+
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def to_safe_pil(img_tensor: torch.Tensor, denormalize=None) -> Image.Image:
@@ -71,6 +75,112 @@ def build_denormalize(arch: str):
         return t * std + mean
 
     return denorm
+
+
+def build_denormalize_from_stats(arch: str, mean: List[float], std: List[float]):
+    """Return a denormalization fn for visualization for normalized RGB tensors."""
+    if arch.lower() == "lenet":
+        return None
+    mean_t = torch.tensor(mean).view(3, 1, 1)
+    std_t = torch.tensor(std).view(3, 1, 1)
+
+    def denorm(t: torch.Tensor) -> torch.Tensor:
+        return t * std_t + mean_t
+
+    return denorm
+
+
+class TinyImageNetValDataset(torch.utils.data.Dataset):
+    """Tiny-ImageNet-200 val split loader using val_annotations.txt (ImageFolder can't read it directly)."""
+
+    def __init__(
+        self,
+        tiny_root: Path,
+        transform: Optional[Callable] = None,
+        class_to_idx: Optional[Dict[str, int]] = None,
+    ):
+        self.tiny_root = Path(tiny_root)
+        self.transform = transform
+        if class_to_idx is None:
+            wnids_path = self.tiny_root / "wnids.txt"
+            if not wnids_path.exists():
+                raise FileNotFoundError(f"Missing {wnids_path} (expected Tiny-ImageNet-200 layout).")
+            wnids = sorted(line.strip() for line in wnids_path.read_text().splitlines() if line.strip())
+            class_to_idx = {wnid: i for i, wnid in enumerate(wnids)}
+        self.class_to_idx = class_to_idx
+
+        val_dir = self.tiny_root / "val"
+        images_dir = val_dir / "images"
+        ann_path = val_dir / "val_annotations.txt"
+        if not images_dir.exists() or not ann_path.exists():
+            raise FileNotFoundError(
+                f"Missing Tiny-ImageNet val data. Expected {images_dir} and {ann_path} to exist."
+            )
+
+        items: List[Tuple[Path, int]] = []
+        for line in ann_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            fname, wnid = parts[0], parts[1]
+            if wnid not in self.class_to_idx:
+                continue
+            img_path = images_dir / fname
+            if img_path.exists():
+                items.append((img_path, self.class_to_idx[wnid]))
+        if not items:
+            raise RuntimeError(f"Parsed 0 val items from {ann_path}. Check Tiny-ImageNet-200 layout.")
+        self.items = items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        path, label = self.items[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+def build_dataset_and_transform(args):
+    """Return (dataset, num_classes, denormalize_fn)."""
+    dataset_name = args.dataset.lower()
+
+    if dataset_name == "cifar100":
+        transform = default_transform(args.arch)
+        dataset = datasets.CIFAR100(args.data_root, download=True, transform=transform)
+        num_classes = 100
+        denormalize = build_denormalize(args.arch)
+        return dataset, num_classes, denormalize
+
+    if dataset_name == "tiny-imagenet":
+        image_size = args.image_size
+        ops = [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+        ]
+        if args.arch.lower() != "lenet":
+            ops.append(transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+        transform = transforms.Compose(ops)
+        data_root = Path(args.data_root).expanduser()
+        tiny_root = data_root if data_root.name == "tiny-imagenet-200" else (data_root / "tiny-imagenet-200")
+        if args.dataset_split == "train":
+            dataset = datasets.ImageFolder(str(tiny_root / "train"), transform=transform)
+        else:
+            dataset = TinyImageNetValDataset(tiny_root=tiny_root, transform=transform)
+        num_classes = 200
+        denormalize = (
+            build_denormalize_from_stats(args.arch, IMAGENET_MEAN, IMAGENET_STD)
+            if args.arch.lower() != "lenet"
+            else None
+        )
+        return dataset, num_classes, denormalize
+
+    raise ValueError(f"Unsupported --dataset '{args.dataset}'. Choose from: cifar100, tiny-imagenet")
 
 
 def save_image(tensor: torch.Tensor, path: Path, denormalize=None):
@@ -188,6 +298,26 @@ def parse_args():
         help="Device to run on. 'auto' picks CUDA if available.",
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar100",
+        choices=["cifar100", "tiny-imagenet"],
+        help="Dataset to reconstruct from.",
+    )
+    parser.add_argument(
+        "--dataset-split",
+        type=str,
+        default="train",
+        choices=["train", "val"],
+        help="Dataset split (for tiny-imagenet).",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=64,
+        help="Input image size (used for tiny-imagenet transforms).",
+    )
+    parser.add_argument(
         "--arch",
         type=str,
         default="lenet",
@@ -282,14 +412,14 @@ def parse_args():
         "--client-indices",
         type=str,
         default=None,
-        help="Comma separated CIFAR100 indices (must equal num_clients * samples_per_client).",
+        help="Comma separated dataset indices (must equal num_clients * samples_per_client).",
     )
     parser.add_argument("--seed", type=int, default=1234, help="Seed for sampling client data.")
     parser.add_argument(
         "--data-root",
         type=str,
         default="~/.torch",
-        help="Location to download/load CIFAR100.",
+        help="Dataset root. For CIFAR100: download/cache root. For tiny-imagenet: directory containing tiny-imagenet-200/",
     )
     return parser.parse_args()
 
@@ -641,11 +771,8 @@ def main():
         device = "cpu"
     print(f"Running on {device}")
 
-    transform = default_transform(args.arch)
-    dataset = datasets.CIFAR100(args.data_root, download=True, transform=transform)
-    num_classes = 100
+    dataset, num_classes, denormalize = build_dataset_and_transform(args)
     total_samples = args.num_clients * args.samples_per_client
-    denormalize = build_denormalize(args.arch)
 
     torch.manual_seed(args.seed)
     indices = pick_indices(args, total_samples, len(dataset))

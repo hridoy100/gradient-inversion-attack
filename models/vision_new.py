@@ -62,7 +62,7 @@ def _build_mobilenet_v2(num_classes: int, pretrained: bool = False):
 
 
 MODEL_BUILDERS: Dict[str, Callable[[int, bool], nn.Module]] = {
-    "lenet": lambda num_classes, pretrained=False: LeNet().apply(lenet_weights_init),
+    "lenet": lambda num_classes, pretrained=False: LeNet(num_classes=num_classes).apply(lenet_weights_init),
     "resnet18": _build_resnet18,
     "resnet34": _build_resnet34,
     "resnet50": _build_resnet50,
