@@ -19,6 +19,7 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 from torchvision import datasets, transforms
+from torchvision.utils import make_grid
 
 # Ensure repository root is importable when running this script directly.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +75,33 @@ def to_safe_pil(img_tensor: torch.Tensor, denormalize=None):
     img_tensor = torch.nan_to_num(img_tensor, nan=0.0, posinf=1.0, neginf=0.0)
     img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
     return transforms.ToPILImage()(img_tensor)
+
+
+def to_safe_grid_pil(
+    img_batch: torch.Tensor,
+    denormalize=None,
+    max_cols: int = 8,
+    padding: int = 2,
+    pad_value: float = 1.0,
+):
+    """Convert a (N, C, H, W) batch into a tiled PIL image for visualization."""
+    if img_batch.dim() == 3:
+        img_batch = img_batch.unsqueeze(0)
+    if img_batch.dim() != 4:
+        raise ValueError(f"Expected image batch of shape (N,C,H,W) or (C,H,W), got {tuple(img_batch.shape)}")
+    img_batch = img_batch.detach().cpu()
+    if denormalize:
+        img_batch = denormalize(img_batch)
+    img_batch = torch.nan_to_num(img_batch, nan=0.0, posinf=1.0, neginf=0.0)
+    img_batch = torch.clamp(img_batch, 0.0, 1.0)
+    nrow = max(1, int(max_cols))
+    grid = make_grid(img_batch, nrow=nrow, padding=padding, pad_value=pad_value)
+    return transforms.ToPILImage()(grid)
+
+
+def save_grid_image(batch_tensor: torch.Tensor, path: Path, denormalize=None, max_cols: int = 8):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    to_safe_grid_pil(batch_tensor, denormalize=denormalize, max_cols=max_cols).save(path)
 
 
 def build_denormalize(arch: str):
@@ -157,11 +185,12 @@ def align_reconstruction_to_original(
     original_01: torch.Tensor,
     reconstructed_01: torch.Tensor,
     recovered_labels: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    history: list = None,
+) -> Tuple[torch.Tensor, torch.Tensor, list]:
     """Align reconstructed batch order to match original batch order (batch gradient is permutation-invariant)."""
     n = min(original_01.size(0), reconstructed_01.size(0))
     if n <= 1:
-        return reconstructed_01, recovered_labels
+        return reconstructed_01, recovered_labels, history
 
     original_flat = original_01[:n].detach().cpu().flatten(1)
     recon_flat = reconstructed_01[:n].detach().cpu().flatten(1)
@@ -169,7 +198,14 @@ def align_reconstruction_to_original(
     cost = (diff * diff).mean(dim=-1)
     perm = _linear_sum_assignment(cost.tolist())
     perm_t = torch.as_tensor(perm, device=reconstructed_01.device, dtype=torch.long)
-    return reconstructed_01.index_select(0, perm_t), recovered_labels.index_select(0, perm_t)
+    reconstructed_01 = reconstructed_01.index_select(0, perm_t)
+    recovered_labels = recovered_labels.index_select(0, perm_t)
+    if history:
+        perm_cpu = perm_t.detach().cpu()
+        for entry in history:
+            if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor) and entry["data"].dim() == 4:
+                entry["data"] = entry["data"].index_select(0, perm_cpu)
+    return reconstructed_01, recovered_labels, history
 
 
 def pick_indices(total_samples: int, dataset_size: int, seed: int, client_indices: str = None) -> List[int]:
@@ -365,6 +401,7 @@ def diffusion_guided_reconstruction(
             prior_loss_val = float(prior_loss.item()) if prior_weight > 0 else 0.0
 
         if step % log_every == 0 or step == total_steps - 1:
+            snapshot = torch.clamp((current.detach().cpu() + 1.0) / 2.0, 0.0, 1.0)
             history.append(
                 {
                     "step": int(step),
@@ -372,6 +409,7 @@ def diffusion_guided_reconstruction(
                     "prior_loss": float(prior_loss_val),
                     "total_loss": float(total_loss.item()),
                     "tv_loss": float(tv_loss.item()) if tv_weight > 0 else 0.0,
+                    "data": snapshot,
                 }
             )
         # Track best iterate by total_loss to avoid late divergence.
@@ -424,11 +462,28 @@ def save_client_outputs(
         save_image(original_batch[idx], client_dir / f"original_{idx}.png", denormalize)
         save_image(reconstructed_batch[idx], client_dir / f"reconstructed_{idx}.png")
 
+    if history:
+        hist_dir = client_dir / "history"
+        for entry in history:
+            if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor):
+                save_grid_image(
+                    entry["data"],
+                    hist_dir / f"step_{entry['step']}.png",
+                    denormalize=None,
+                    max_cols=min(original_batch.size(0), 8),
+                )
+
     (client_dir / f"metrics_client_{client_id}_round_{round_id}.json").write_text(
         json.dumps(metrics, indent=2)
     )
     (client_dir / f"loss_client_{client_id}_round_{round_id}.json").write_text(
-        json.dumps(history, indent=2)
+        json.dumps(
+            [
+                {k: v for k, v in entry.items() if k != "data"}
+                for entry in history
+            ],
+            indent=2,
+        )
     )
 
 
@@ -478,6 +533,11 @@ def parse_args():
         "--cuda-stable",
         action="store_true",
         help="Convenience flag: equivalent to setting --no-tf32 and --deterministic.",
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Show matplotlib figures (original vs reconstructed + iteration history).",
     )
     parser.add_argument("--arch", type=str, default="lenet", choices=sorted(MODEL_BUILDERS.keys()))
     parser.add_argument("--pretrained", action="store_true", help="Use torchvision pretrained weights when available.")
@@ -736,8 +796,8 @@ def main():
                 visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
             visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
 
-            visual_reconstructed, recovered_labels_cpu = align_reconstruction_to_original(
-                visual_original, visual_reconstructed, recovered_labels_cpu
+            visual_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
+                visual_original, visual_reconstructed, recovered_labels_cpu, history
             )
             metrics = compute_metrics(
                 visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu
@@ -806,8 +866,8 @@ def main():
             visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
 
         recovered_labels_cpu = recovered_labels.detach().cpu()
-        all_reconstructed, recovered_labels_cpu = align_reconstruction_to_original(
-            visual_original, all_reconstructed, recovered_labels_cpu
+        all_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
+            visual_original, all_reconstructed, recovered_labels_cpu, history
         )
         metrics = compute_metrics(
             visual_original,
@@ -832,7 +892,25 @@ def main():
             save_image(all_reconstructed[idx], agg_dir / f"reconstructed_{idx}.png", None)
 
         (agg_dir / "metrics_aggregated.json").write_text(json.dumps(metrics, indent=2))
-        (agg_dir / "loss_aggregated.json").write_text(json.dumps(history, indent=2))
+        if history:
+            hist_dir = agg_dir / "history"
+            total_samples = visual_original.size(0)
+            for entry in history:
+                if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor):
+                    for client_id in range(args.num_clients):
+                        start = client_id * args.samples_per_client
+                        end = min(start + args.samples_per_client, total_samples)
+                        if start >= total_samples:
+                            break
+                        save_grid_image(
+                            entry["data"][start:end],
+                            hist_dir / f"client_{client_id}_step_{entry['step']}.png",
+                            denormalize=None,
+                            max_cols=min(end - start, 8),
+                        )
+        (agg_dir / "loss_aggregated.json").write_text(
+            json.dumps([{k: v for k, v in entry.items() if k != "data"} for entry in history], indent=2)
+        )
         print(f"Aggregated reconstruction saved with metrics {metrics}")
 
     if metrics_rows:
@@ -852,6 +930,77 @@ def main():
             )
             writer.writeheader()
             writer.writerows(metrics_rows)
+
+    if args.visualize:
+        import matplotlib.pyplot as plt
+
+        # Per-client figures.
+        if args.reconstruct_mode in ("per-client", "both"):
+            for client in clients:
+                client_dir = run_dir / f"client_{client.client_id}_round_{args.round_id}"
+                if not client_dir.exists():
+                    continue
+                originals = sorted(client_dir.glob("original_*.png"))
+                recons = sorted(client_dir.glob("reconstructed_*.png"))
+                cols = min(len(originals), len(recons))
+                if cols:
+                    fig = plt.figure(figsize=(2.5 * cols, 5))
+                    for i in range(cols):
+                        ax = plt.subplot(2, cols, i + 1)
+                        ax.imshow(Image.open(originals[i]))
+                        ax.set_title(f"Client {client.client_id} Real {i}", fontsize=9)
+                        ax.axis("off")
+                        ax = plt.subplot(2, cols, i + 1 + cols)
+                        ax.imshow(Image.open(recons[i]))
+                        ax.set_title("Reconstructed", fontsize=9)
+                        ax.axis("off")
+                    fig.tight_layout()
+
+                hist_dir = client_dir / "history"
+                steps = sorted(hist_dir.glob("step_*.png"))
+                if steps:
+                    fig = plt.figure(figsize=(3 * len(steps), 3.6))
+                    for j, pth in enumerate(steps):
+                        ax = plt.subplot(1, len(steps), j + 1)
+                        ax.imshow(Image.open(pth))
+                        ax.set_title(pth.stem.replace("_", " "), fontsize=8)
+                        ax.axis("off")
+                    fig.tight_layout()
+
+        # Aggregated figure + per-client history windows.
+        if args.reconstruct_mode in ("aggregated", "both"):
+            agg_dir = run_dir / "aggregated"
+            originals = sorted(agg_dir.glob("original_*.png"))
+            recons = sorted(agg_dir.glob("reconstructed_*.png"))
+            cols = min(len(originals), len(recons), 8)
+            if cols:
+                fig = plt.figure(figsize=(2.5 * cols, 5))
+                for i in range(cols):
+                    ax = plt.subplot(2, cols, i + 1)
+                    ax.imshow(Image.open(originals[i]))
+                    ax.set_title(f"Real {i}", fontsize=9)
+                    ax.axis("off")
+                    ax = plt.subplot(2, cols, i + 1 + cols)
+                    ax.imshow(Image.open(recons[i]))
+                    ax.set_title("Reconstructed", fontsize=9)
+                    ax.axis("off")
+                fig.tight_layout()
+
+            hist_dir = agg_dir / "history"
+            if hist_dir.exists():
+                for client_id in range(args.num_clients):
+                    client_steps = sorted(hist_dir.glob(f"client_{client_id}_step_*.png"))
+                    if not client_steps:
+                        continue
+                    fig = plt.figure(figsize=(3 * len(client_steps), 3.6))
+                    for j, pth in enumerate(client_steps):
+                        ax = plt.subplot(1, len(client_steps), j + 1)
+                        ax.imshow(Image.open(pth))
+                        ax.set_title(pth.stem.replace("_", " "), fontsize=8)
+                        ax.axis("off")
+                    fig.tight_layout()
+
+        plt.show()
 
 
 if __name__ == "__main__":
