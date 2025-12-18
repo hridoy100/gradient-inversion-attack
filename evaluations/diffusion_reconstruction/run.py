@@ -67,6 +67,10 @@ from models.vision_new import CIFAR100_MEAN, CIFAR100_STD, MODEL_BUILDERS, build
 from utils import cross_entropy_for_onehot
 
 
+CIFAR10_MEAN = [0.4914, 0.4822, 0.4465]
+CIFAR10_STD = [0.2470, 0.2435, 0.2616]
+
+
 def to_safe_pil(img_tensor: torch.Tensor, denormalize=None):
     """Convert tensor to PIL image with optional denormalization and clamping."""
     img_tensor = img_tensor.detach().cpu()
@@ -104,15 +108,17 @@ def save_grid_image(batch_tensor: torch.Tensor, path: Path, denormalize=None, ma
     to_safe_grid_pil(batch_tensor, denormalize=denormalize, max_cols=max_cols).save(path)
 
 
-def build_denormalize(arch: str):
-    """Return a denormalization fn for visualization given the chosen arch."""
+def build_denormalize(arch: str, mean: List[float] = None, std: List[float] = None):
+    """Return a denormalization fn for visualization given the chosen arch and dataset stats."""
     if arch.lower() == "lenet":
         return None
-    mean = torch.tensor(CIFAR100_MEAN).view(3, 1, 1)
-    std = torch.tensor(CIFAR100_STD).view(3, 1, 1)
+    mean = CIFAR100_MEAN if mean is None else mean
+    std = CIFAR100_STD if std is None else std
+    mean_t = torch.tensor(mean).view(3, 1, 1)
+    std_t = torch.tensor(std).view(3, 1, 1)
 
     def denorm(t: torch.Tensor) -> torch.Tensor:
-        return t * std + mean
+        return t * std_t + mean_t
 
     return denorm
 
@@ -244,14 +250,14 @@ def build_clients(dataset, indices: List[int], num_clients: int, samples_per_cli
     return clients
 
 
-def normalize_for_model(x: torch.Tensor, arch: str) -> torch.Tensor:
+def normalize_for_model(x: torch.Tensor, arch: str, mean: List[float], std: List[float]) -> torch.Tensor:
     """Map diffusion space [-1, 1] to model input space (optionally normalized)."""
     x01 = torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
     if arch.lower() == "lenet":
         return x01
-    mean = torch.tensor(CIFAR100_MEAN, device=x.device).view(1, 3, 1, 1)
-    std = torch.tensor(CIFAR100_STD, device=x.device).view(1, 3, 1, 1)
-    return (x01 - mean) / std
+    mean_t = torch.tensor(mean, device=x.device).view(1, 3, 1, 1)
+    std_t = torch.tensor(std, device=x.device).view(1, 3, 1, 1)
+    return (x01 - mean_t) / std_t
 
 
 def total_variation(img: torch.Tensor) -> torch.Tensor:
@@ -266,11 +272,13 @@ def gradient_match_loss(
     model: torch.nn.Module,
     target_gradients: List[torch.Tensor],
     arch: str,
+    mean: List[float],
+    std: List[float],
     tv_weight: float = 0.0,
     grad_loss_mode: str = "l2mean",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Squared gradient matching loss with optional TV regularization."""
-    model_input = normalize_for_model(dummy_data, arch)
+    model_input = normalize_for_model(dummy_data, arch, mean, std)
     pred = model(model_input)
     dummy_onehot = F.softmax(label_logits, dim=-1)
     dummy_loss = cross_entropy_for_onehot(pred, dummy_onehot)
@@ -302,6 +310,8 @@ def diffusion_guided_reconstruction(
     data_shape: torch.Size,
     num_classes: int,
     arch: str,
+    mean: List[float],
+    std: List[float],
     diffusion_model: UNet2DModel,
     scheduler: DDPMScheduler,
     prior_mode: str = "denoise",
@@ -363,6 +373,8 @@ def diffusion_guided_reconstruction(
                 model,
                 target_gradients,
                 arch,
+                mean,
+                std,
                 tv_weight=tv_weight,
                 grad_loss_mode=grad_loss_mode,
             )
@@ -570,6 +582,13 @@ def parse_args():
         help="Convenience flag: equivalent to setting --no-tf32 and --deterministic.",
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar100",
+        choices=["cifar100", "cifar10"],
+        help="Dataset used for gradient collection (diffusion prior is CIFAR10 by default).",
+    )
+    parser.add_argument(
         "--method",
         type=str,
         default="diffusion",
@@ -704,7 +723,7 @@ def parse_args():
         "--client-indices",
         type=str,
         default=None,
-        help="Comma separated CIFAR100 indices (must equal num_clients * samples_per_client).",
+        help="Comma separated dataset indices (must equal num_clients * samples_per_client).",
     )
     parser.add_argument(
         "--normalize-gradients",
@@ -772,11 +791,21 @@ def main():
                     )
     print(f"Running diffusion-guided reconstruction on {device}")
 
-    transform = default_transform(args.arch)
-    dataset = datasets.CIFAR100(args.data_root, download=True, transform=transform)
-    num_classes = 100
+    if args.dataset == "cifar10":
+        mean, std = CIFAR10_MEAN, CIFAR10_STD
+        if args.arch.lower() == "lenet":
+            transform = transforms.ToTensor()
+        else:
+            transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])
+        dataset = datasets.CIFAR10(args.data_root, download=True, transform=transform)
+        num_classes = 10
+    else:
+        mean, std = CIFAR100_MEAN, CIFAR100_STD
+        transform = default_transform(args.arch)
+        dataset = datasets.CIFAR100(args.data_root, download=True, transform=transform)
+        num_classes = 100
     total_samples = args.num_clients * args.samples_per_client
-    denormalize = build_denormalize(args.arch)
+    denormalize = build_denormalize(args.arch, mean=mean, std=std)
 
     torch.manual_seed(args.seed)
     indices = pick_indices(total_samples, len(dataset), seed=args.seed, client_indices=args.client_indices)
@@ -868,6 +897,8 @@ def main():
                     data_shape=client.data.shape,
                     num_classes=num_classes,
                     arch=args.arch,
+                    mean=mean,
+                    std=std,
                     diffusion_model=diffusion_model,
                     scheduler=scheduler,
                     prior_mode=args.prior_mode,
@@ -978,6 +1009,8 @@ def main():
                 data_shape=data_shape,
                 num_classes=num_classes,
                 arch=args.arch,
+                mean=mean,
+                std=std,
                 diffusion_model=diffusion_model,
                 scheduler=scheduler,
                 prior_mode=args.prior_mode,
