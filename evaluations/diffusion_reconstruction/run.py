@@ -32,6 +32,19 @@ if not hasattr(torch, "xpu"):
             return None
     torch.xpu = _DummyXPU()  # type: ignore[attr-defined]
 
+# Newer diffusers may reference torch.mps; some torch builds (non-macOS or older versions) lack it.
+if not hasattr(torch, "mps"):
+    class _DummyMPS:
+        @staticmethod
+        def empty_cache():
+            return None
+
+        @staticmethod
+        def is_available():
+            return False
+
+    torch.mps = _DummyMPS()  # type: ignore[attr-defined]
+
 try:
     from diffusers import (
     DDPMScheduler,
