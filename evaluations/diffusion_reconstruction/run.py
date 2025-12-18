@@ -487,6 +487,41 @@ def save_client_outputs(
     )
 
 
+def save_dlg_client_outputs(
+    save_dir: Path,
+    client_id: int,
+    round_id: int,
+    original_batch_01: torch.Tensor,
+    reconstructed_batch_01: torch.Tensor,
+    metrics: dict,
+    history: list,
+):
+    client_dir = save_dir / f"client_{client_id}_round_{round_id}"
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx in range(original_batch_01.size(0)):
+        save_image(original_batch_01[idx], client_dir / f"original_{idx}.png", denormalize=None)
+        save_image(reconstructed_batch_01[idx], client_dir / f"reconstructed_{idx}.png", denormalize=None)
+
+    if history:
+        hist_dir = client_dir / "history"
+        for entry in history:
+            if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor):
+                save_grid_image(
+                    torch.clamp(entry["data"].detach().cpu(), 0.0, 1.0),
+                    hist_dir / f"iter_{entry['iteration']}.png",
+                    denormalize=None,
+                    max_cols=min(original_batch_01.size(0), 8),
+                )
+
+    (client_dir / f"metrics_client_{client_id}_round_{round_id}.json").write_text(
+        json.dumps(metrics, indent=2)
+    )
+    (client_dir / f"loss_client_{client_id}_round_{round_id}.json").write_text(
+        json.dumps([{k: v for k, v in entry.items() if k != "data"} for entry in history], indent=2)
+    )
+
+
 def load_diffusion_prior(device: str, repo_id: str = "google/ddpm-cifar10-32", scheduler_type: str = "ddpm"):
     """Load a CIFAR-scale diffusion prior with a configurable scheduler."""
     schedulers = {
@@ -533,6 +568,48 @@ def parse_args():
         "--cuda-stable",
         action="store_true",
         help="Convenience flag: equivalent to setting --no-tf32 and --deterministic.",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="diffusion",
+        choices=["diffusion", "dlg", "both"],
+        help="Reconstruction method: diffusion-guided, DLG baseline (LBFGS), or both.",
+    )
+    parser.add_argument(
+        "--dlg-iterations",
+        type=int,
+        default=300,
+        help="DLG baseline: LBFGS iterations (only used with --method dlg/both).",
+    )
+    parser.add_argument(
+        "--dlg-restarts",
+        type=int,
+        default=1,
+        help="DLG baseline: number of restarts (only used with --method dlg/both).",
+    )
+    parser.add_argument(
+        "--dlg-log-every",
+        type=int,
+        default=25,
+        help="DLG baseline: store intermediate iterates every N steps (only used with --method dlg/both).",
+    )
+    parser.add_argument(
+        "--dlg-init-scale",
+        type=float,
+        default=1.0,
+        help="DLG baseline: dummy init std multiplier (only used with --method dlg/both).",
+    )
+    parser.add_argument(
+        "--dlg-tv-weight",
+        type=float,
+        default=0.0,
+        help="DLG baseline: TV regularization weight (only used with --method dlg/both).",
+    )
+    parser.add_argument(
+        "--dlg-progress",
+        action="store_true",
+        help="DLG baseline: show tqdm progress bars (only used with --method dlg/both).",
     )
     parser.add_argument(
         "--visualize",
@@ -715,11 +792,14 @@ def main():
 
     clients = build_clients(dataset, indices, args.num_clients, args.samples_per_client, device, num_classes)
     scheduler_type = args.scheduler
-    if args.prior_mode == "score" and scheduler_type != "ddpm":
-        # Score mode relies on a training-like noise schedule (add_noise); DDPM is the safest default.
-        print("prior-mode=score: overriding --scheduler to 'ddpm' for add_noise compatibility.")
-        scheduler_type = "ddpm"
-    diffusion_model, scheduler = load_diffusion_prior(device, repo_id=args.diffusion_model, scheduler_type=scheduler_type)
+    diffusion_model = None
+    scheduler = None
+    if args.method in ("diffusion", "both"):
+        if args.prior_mode == "score" and scheduler_type != "ddpm":
+            # Score mode relies on a training-like noise schedule (add_noise); DDPM is the safest default.
+            print("prior-mode=score: overriding --scheduler to 'ddpm' for add_noise compatibility.")
+            scheduler_type = "ddpm"
+        diffusion_model, scheduler = load_diffusion_prior(device, repo_id=args.diffusion_model, scheduler_type=scheduler_type)
     server = FederatedServer(model, device=device, num_classes=num_classes)
 
     run_dir = Path(args.save_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -734,6 +814,7 @@ def main():
         "indices": indices,
         "num_clients": args.num_clients,
         "samples_per_client": args.samples_per_client,
+        "method": args.method,
         "diffusion_steps": args.diffusion_steps,
         "match_steps": args.match_steps,
         "match_lr": args.match_lr,
@@ -754,6 +835,11 @@ def main():
         "prior_t_min": args.prior_t_min,
         "prior_t_max": args.prior_t_max,
         "grad_loss_mode": args.grad_loss_mode,
+        "dlg_iterations": args.dlg_iterations,
+        "dlg_restarts": args.dlg_restarts,
+        "dlg_log_every": args.dlg_log_every,
+        "dlg_init_scale": args.dlg_init_scale,
+        "dlg_tv_weight": args.dlg_tv_weight,
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -766,10 +852,130 @@ def main():
 
     if args.reconstruct_mode in ("per-client", "both"):
         for client, grads in zip(clients, client_gradients):
+            start = client.client_id * args.samples_per_client
+            end = start + args.samples_per_client
+
+            original_batch = client.data.detach().cpu()
+            labels_cpu = client.labels.detach().cpu()
+            visual_original = original_batch
+            if denormalize:
+                visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
+
+            if args.method in ("diffusion", "both"):
+                recovered_data, recovered_labels, history = diffusion_guided_reconstruction(
+                    model=model,
+                    target_gradients=grads,
+                    data_shape=client.data.shape,
+                    num_classes=num_classes,
+                    arch=args.arch,
+                    diffusion_model=diffusion_model,
+                    scheduler=scheduler,
+                    prior_mode=args.prior_mode,
+                    prior_weight=args.prior_weight,
+                    prior_t_min=args.prior_t_min,
+                    prior_t_max=args.prior_t_max,
+                    grad_loss_mode=args.grad_loss_mode,
+                    diffusion_steps=args.diffusion_steps,
+                    match_lr=args.match_lr,
+                    match_steps=args.match_steps,
+                    label_lr=args.label_lr,
+                    tv_weight=args.tv_weight,
+                    log_every=args.log_every,
+                )
+
+                reconstructed_batch = recovered_data.detach().cpu()
+                recovered_labels_cpu = recovered_labels.detach().cpu()
+                visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
+                visual_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
+                    visual_original, visual_reconstructed, recovered_labels_cpu, history
+                )
+                metrics = compute_metrics(visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu)
+                metrics_rows.append(
+                    {
+                        "round_id": int(args.round_id),
+                        "mode": "per-client",
+                        "client_id": int(client.client_id),
+                        "dataset_indices": ",".join(str(i) for i in indices[start:end]),
+                        **{k: float(v) for k, v in metrics.items()},
+                    }
+                )
+                save_client_outputs(
+                    run_dir,
+                    client_id=client.client_id,
+                    round_id=args.round_id,
+                    original_batch=visual_original,
+                    reconstructed_batch=visual_reconstructed,
+                    denormalize=None,
+                    metrics=metrics,
+                    history=history,
+                )
+                print(f"Client {client.client_id}: diffusion-guided reconstruction saved with metrics {metrics}")
+
+            if args.method in ("dlg", "both"):
+                recovered_data, recovered_labels, history = server.reconstruct_data(
+                    grads,
+                    data_shape=client.data.shape,
+                    iterations=args.dlg_iterations,
+                    log_every=args.dlg_log_every,
+                    restarts=args.dlg_restarts,
+                    init_seed=args.seed,
+                    tv_weight=args.dlg_tv_weight,
+                    init_scale=args.dlg_init_scale,
+                    progress=args.dlg_progress,
+                )
+                recovered_labels_cpu = recovered_labels.detach().cpu()
+                reconstructed_batch = recovered_data.detach().cpu()
+                if denormalize:
+                    reconstructed_batch = denormalize(reconstructed_batch)
+                visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
+                visual_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
+                    visual_original, visual_reconstructed, recovered_labels_cpu, history
+                )
+                metrics = compute_metrics(visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu)
+                metrics_rows.append(
+                    {
+                        "round_id": int(args.round_id),
+                        "mode": "dlg-per-client",
+                        "client_id": int(client.client_id),
+                        "dataset_indices": ",".join(str(i) for i in indices[start:end]),
+                        **{k: float(v) for k, v in metrics.items()},
+                    }
+                )
+                save_dlg_client_outputs(
+                    run_dir / "dlg_baseline",
+                    client_id=client.client_id,
+                    round_id=args.round_id,
+                    original_batch_01=visual_original,
+                    reconstructed_batch_01=visual_reconstructed,
+                    metrics=metrics,
+                    history=history,
+                )
+                print(f"Client {client.client_id}: DLG baseline reconstruction saved with metrics {metrics}")
+
+    if args.reconstruct_mode in ("aggregated", "both"):
+        aggregated_gradients = server.aggregate_gradients(
+            client_gradients, normalize=args.normalize_gradients
+        )
+        print(f"Aggregated gradients collected. normalize_gradients={args.normalize_gradients}")
+
+        if args.apply_agg_step:
+            print(f"Applying aggregated gradient step to model with lr={args.agg_lr}")
+            server.apply_gradient_step(aggregated_gradients, lr=args.agg_lr)
+
+        total_samples = args.num_clients * args.samples_per_client
+        data_shape = torch.Size((total_samples, *clients[0].data.shape[1:]))
+
+        all_original = torch.cat([client.data for client in clients], dim=0).detach().cpu()
+        all_labels = torch.cat([client.labels for client in clients], dim=0).detach().cpu()
+        visual_original = all_original
+        if denormalize:
+            visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
+
+        if args.method in ("diffusion", "both"):
             recovered_data, recovered_labels, history = diffusion_guided_reconstruction(
                 model=model,
-                target_gradients=grads,
-                data_shape=client.data.shape,
+                target_gradients=aggregated_gradients,
+                data_shape=data_shape,
                 num_classes=num_classes,
                 arch=args.arch,
                 diffusion_model=diffusion_model,
@@ -787,131 +993,109 @@ def main():
                 log_every=args.log_every,
             )
 
-            original_batch = client.data.detach().cpu()
-            reconstructed_batch = recovered_data.detach().cpu()
-            labels_cpu = client.labels.detach().cpu()
+            all_reconstructed = torch.clamp(recovered_data.detach().cpu(), 0.0, 1.0)
             recovered_labels_cpu = recovered_labels.detach().cpu()
-            visual_original = original_batch
-            if denormalize:
-                visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
-            visual_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
-
-            visual_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
-                visual_original, visual_reconstructed, recovered_labels_cpu, history
+            all_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
+                visual_original, all_reconstructed, recovered_labels_cpu, history
             )
-            metrics = compute_metrics(
-                visual_original, visual_reconstructed, labels_cpu, recovered_labels_cpu
-            )
-            start = client.client_id * args.samples_per_client
-            end = start + args.samples_per_client
+            metrics = compute_metrics(visual_original, all_reconstructed, all_labels, recovered_labels_cpu)
             metrics_rows.append(
                 {
                     "round_id": int(args.round_id),
-                    "mode": "per-client",
-                    "client_id": int(client.client_id),
-                    "dataset_indices": ",".join(str(i) for i in indices[start:end]),
+                    "mode": "aggregated",
+                    "client_id": "",
+                    "dataset_indices": ",".join(str(i) for i in indices),
                     **{k: float(v) for k, v in metrics.items()},
                 }
             )
-            save_client_outputs(
-                run_dir,
-                client_id=client.client_id,
-                round_id=args.round_id,
-                original_batch=visual_original,
-                reconstructed_batch=visual_reconstructed,
-                denormalize=None,
-                metrics=metrics,
-                history=history,
+
+            agg_dir = run_dir / "aggregated"
+            agg_dir.mkdir(parents=True, exist_ok=True)
+            for idx in range(visual_original.size(0)):
+                save_image(visual_original[idx], agg_dir / f"original_{idx}.png", None)
+                save_image(all_reconstructed[idx], agg_dir / f"reconstructed_{idx}.png", None)
+
+            (agg_dir / "metrics_aggregated.json").write_text(json.dumps(metrics, indent=2))
+            if history:
+                hist_dir = agg_dir / "history"
+                for entry in history:
+                    if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor):
+                        for client_id in range(args.num_clients):
+                            start = client_id * args.samples_per_client
+                            end = min(start + args.samples_per_client, total_samples)
+                            if start >= total_samples:
+                                break
+                            save_grid_image(
+                                entry["data"][start:end],
+                                hist_dir / f"client_{client_id}_step_{entry['step']}.png",
+                                denormalize=None,
+                                max_cols=min(end - start, 8),
+                            )
+            (agg_dir / "loss_aggregated.json").write_text(
+                json.dumps([{k: v for k, v in entry.items() if k != "data"} for entry in history], indent=2)
             )
-            print(f"Client {client.client_id}: reconstruction saved with metrics {metrics}")
+            print(f"Aggregated diffusion-guided reconstruction saved with metrics {metrics}")
 
-    if args.reconstruct_mode in ("aggregated", "both"):
-        aggregated_gradients = server.aggregate_gradients(
-            client_gradients, normalize=args.normalize_gradients
-        )
-        print(f"Aggregated gradients collected. normalize_gradients={args.normalize_gradients}")
+        if args.method in ("dlg", "both"):
+            recovered_data, recovered_labels, history = server.reconstruct_data(
+                aggregated_gradients,
+                data_shape=data_shape,
+                iterations=args.dlg_iterations,
+                log_every=args.dlg_log_every,
+                restarts=args.dlg_restarts,
+                init_seed=args.seed,
+                tv_weight=args.dlg_tv_weight,
+                init_scale=args.dlg_init_scale,
+                progress=args.dlg_progress,
+            )
+            reconstructed_batch = recovered_data.detach().cpu()
+            if denormalize:
+                reconstructed_batch = denormalize(reconstructed_batch)
+            all_reconstructed = torch.clamp(reconstructed_batch, 0.0, 1.0)
+            recovered_labels_cpu = recovered_labels.detach().cpu()
+            all_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
+                visual_original, all_reconstructed, recovered_labels_cpu, history
+            )
+            metrics = compute_metrics(visual_original, all_reconstructed, all_labels, recovered_labels_cpu)
+            metrics_rows.append(
+                {
+                    "round_id": int(args.round_id),
+                    "mode": "dlg-aggregated",
+                    "client_id": "",
+                    "dataset_indices": ",".join(str(i) for i in indices),
+                    **{k: float(v) for k, v in metrics.items()},
+                }
+            )
 
-        if args.apply_agg_step:
-            print(f"Applying aggregated gradient step to model with lr={args.agg_lr}")
-            server.apply_gradient_step(aggregated_gradients, lr=args.agg_lr)
-
-        total_samples = args.num_clients * args.samples_per_client
-        data_shape = torch.Size((total_samples, *clients[0].data.shape[1:]))
-        recovered_data, recovered_labels, history = diffusion_guided_reconstruction(
-            model=model,
-            target_gradients=aggregated_gradients,
-            data_shape=data_shape,
-            num_classes=num_classes,
-            arch=args.arch,
-            diffusion_model=diffusion_model,
-            scheduler=scheduler,
-            prior_mode=args.prior_mode,
-            prior_weight=args.prior_weight,
-            prior_t_min=args.prior_t_min,
-            prior_t_max=args.prior_t_max,
-            grad_loss_mode=args.grad_loss_mode,
-            diffusion_steps=args.diffusion_steps,
-            match_lr=args.match_lr,
-            match_steps=args.match_steps,
-            label_lr=args.label_lr,
-            tv_weight=args.tv_weight,
-            log_every=args.log_every,
-        )
-
-        all_original = torch.cat([client.data for client in clients], dim=0).detach().cpu()
-        all_labels = torch.cat([client.labels for client in clients], dim=0).detach().cpu()
-        all_reconstructed = torch.clamp(recovered_data.detach().cpu(), 0.0, 1.0)
-        visual_original = all_original
-        if denormalize:
-            visual_original = torch.clamp(denormalize(visual_original), 0.0, 1.0)
-
-        recovered_labels_cpu = recovered_labels.detach().cpu()
-        all_reconstructed, recovered_labels_cpu, history = align_reconstruction_to_original(
-            visual_original, all_reconstructed, recovered_labels_cpu, history
-        )
-        metrics = compute_metrics(
-            visual_original,
-            all_reconstructed,
-            all_labels,
-            recovered_labels_cpu,
-        )
-        metrics_rows.append(
-            {
-                "round_id": int(args.round_id),
-                "mode": "aggregated",
-                "client_id": "",
-                "dataset_indices": ",".join(str(i) for i in indices),
-                **{k: float(v) for k, v in metrics.items()},
-            }
-        )
-
-        agg_dir = run_dir / "aggregated"
-        agg_dir.mkdir(parents=True, exist_ok=True)
-        for idx in range(visual_original.size(0)):
-            save_image(visual_original[idx], agg_dir / f"original_{idx}.png", None)
-            save_image(all_reconstructed[idx], agg_dir / f"reconstructed_{idx}.png", None)
-
-        (agg_dir / "metrics_aggregated.json").write_text(json.dumps(metrics, indent=2))
-        if history:
-            hist_dir = agg_dir / "history"
-            total_samples = visual_original.size(0)
-            for entry in history:
-                if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor):
-                    for client_id in range(args.num_clients):
-                        start = client_id * args.samples_per_client
-                        end = min(start + args.samples_per_client, total_samples)
-                        if start >= total_samples:
-                            break
-                        save_grid_image(
-                            entry["data"][start:end],
-                            hist_dir / f"client_{client_id}_step_{entry['step']}.png",
-                            denormalize=None,
-                            max_cols=min(end - start, 8),
-                        )
-        (agg_dir / "loss_aggregated.json").write_text(
-            json.dumps([{k: v for k, v in entry.items() if k != "data"} for entry in history], indent=2)
-        )
-        print(f"Aggregated reconstruction saved with metrics {metrics}")
+            agg_dir = run_dir / "dlg_baseline" / "aggregated"
+            agg_dir.mkdir(parents=True, exist_ok=True)
+            for idx in range(visual_original.size(0)):
+                save_image(visual_original[idx], agg_dir / f"original_{idx}.png", None)
+                save_image(all_reconstructed[idx], agg_dir / f"reconstructed_{idx}.png", None)
+            (agg_dir / "metrics_aggregated.json").write_text(json.dumps(metrics, indent=2))
+            if history:
+                hist_dir = agg_dir / "history"
+                for entry in history:
+                    if isinstance(entry, dict) and isinstance(entry.get("data"), torch.Tensor):
+                        for client_id in range(args.num_clients):
+                            start = client_id * args.samples_per_client
+                            end = min(start + args.samples_per_client, total_samples)
+                            if start >= total_samples:
+                                break
+                            # LBFGS history stores dummy data in model-space; denormalize for viewing.
+                            batch = entry["data"][start:end].detach().cpu()
+                            if denormalize:
+                                batch = denormalize(batch)
+                            save_grid_image(
+                                torch.clamp(batch, 0.0, 1.0),
+                                hist_dir / f"client_{client_id}_iter_{entry['iteration']}.png",
+                                denormalize=None,
+                                max_cols=min(end - start, 8),
+                            )
+            (agg_dir / "loss_aggregated.json").write_text(
+                json.dumps([{k: v for k, v in entry.items() if k != "data"} for entry in history], indent=2)
+            )
+            print(f"Aggregated DLG baseline reconstruction saved with metrics {metrics}")
 
     if metrics_rows:
         with (run_dir / "metrics.csv").open("w", newline="") as f:
@@ -938,18 +1122,56 @@ def main():
         # Per-client figures.
         if args.reconstruct_mode in ("per-client", "both"):
             for client in clients:
-                client_dir = run_dir / f"client_{client.client_id}_round_{args.round_id}"
-                if not client_dir.exists():
+                for sub, base in (("diffusion", run_dir), ("dlg_baseline", run_dir / "dlg_baseline")):
+                    if not base.exists():
+                        continue
+                    client_dir = base / f"client_{client.client_id}_round_{args.round_id}"
+                    if not client_dir.exists():
+                        continue
+                    originals = sorted(client_dir.glob("original_*.png"))
+                    recons = sorted(client_dir.glob("reconstructed_*.png"))
+                    cols = min(len(originals), len(recons))
+                    if cols:
+                        fig = plt.figure(figsize=(2.5 * cols, 5))
+                        for i in range(cols):
+                            ax = plt.subplot(2, cols, i + 1)
+                            ax.imshow(Image.open(originals[i]))
+                            ax.set_title(f"{sub} C{client.client_id} Real {i}", fontsize=9)
+                            ax.axis("off")
+                            ax = plt.subplot(2, cols, i + 1 + cols)
+                            ax.imshow(Image.open(recons[i]))
+                            ax.set_title("Reconstructed", fontsize=9)
+                            ax.axis("off")
+                        fig.tight_layout()
+
+                    hist_dir = client_dir / "history"
+                    steps = sorted(list(hist_dir.glob("step_*.png")) + list(hist_dir.glob("iter_*.png")))
+                    if steps:
+                        fig = plt.figure(figsize=(3 * len(steps), 3.6))
+                        for j, pth in enumerate(steps):
+                            ax = plt.subplot(1, len(steps), j + 1)
+                            ax.imshow(Image.open(pth))
+                            ax.set_title(pth.stem.replace("_", " "), fontsize=8)
+                            ax.axis("off")
+                        fig.tight_layout()
+
+        # Aggregated figure + per-client history windows.
+        if args.reconstruct_mode in ("aggregated", "both"):
+            for sub, agg_dir in (
+                ("diffusion", run_dir / "aggregated"),
+                ("dlg_baseline", run_dir / "dlg_baseline" / "aggregated"),
+            ):
+                if not agg_dir.exists():
                     continue
-                originals = sorted(client_dir.glob("original_*.png"))
-                recons = sorted(client_dir.glob("reconstructed_*.png"))
-                cols = min(len(originals), len(recons))
+                originals = sorted(agg_dir.glob("original_*.png"))
+                recons = sorted(agg_dir.glob("reconstructed_*.png"))
+                cols = min(len(originals), len(recons), 8)
                 if cols:
                     fig = plt.figure(figsize=(2.5 * cols, 5))
                     for i in range(cols):
                         ax = plt.subplot(2, cols, i + 1)
                         ax.imshow(Image.open(originals[i]))
-                        ax.set_title(f"Client {client.client_id} Real {i}", fontsize=9)
+                        ax.set_title(f"{sub} Real {i}", fontsize=9)
                         ax.axis("off")
                         ax = plt.subplot(2, cols, i + 1 + cols)
                         ax.imshow(Image.open(recons[i]))
@@ -957,49 +1179,22 @@ def main():
                         ax.axis("off")
                     fig.tight_layout()
 
-                hist_dir = client_dir / "history"
-                steps = sorted(hist_dir.glob("step_*.png"))
-                if steps:
-                    fig = plt.figure(figsize=(3 * len(steps), 3.6))
-                    for j, pth in enumerate(steps):
-                        ax = plt.subplot(1, len(steps), j + 1)
-                        ax.imshow(Image.open(pth))
-                        ax.set_title(pth.stem.replace("_", " "), fontsize=8)
-                        ax.axis("off")
-                    fig.tight_layout()
-
-        # Aggregated figure + per-client history windows.
-        if args.reconstruct_mode in ("aggregated", "both"):
-            agg_dir = run_dir / "aggregated"
-            originals = sorted(agg_dir.glob("original_*.png"))
-            recons = sorted(agg_dir.glob("reconstructed_*.png"))
-            cols = min(len(originals), len(recons), 8)
-            if cols:
-                fig = plt.figure(figsize=(2.5 * cols, 5))
-                for i in range(cols):
-                    ax = plt.subplot(2, cols, i + 1)
-                    ax.imshow(Image.open(originals[i]))
-                    ax.set_title(f"Real {i}", fontsize=9)
-                    ax.axis("off")
-                    ax = plt.subplot(2, cols, i + 1 + cols)
-                    ax.imshow(Image.open(recons[i]))
-                    ax.set_title("Reconstructed", fontsize=9)
-                    ax.axis("off")
-                fig.tight_layout()
-
-            hist_dir = agg_dir / "history"
-            if hist_dir.exists():
-                for client_id in range(args.num_clients):
-                    client_steps = sorted(hist_dir.glob(f"client_{client_id}_step_*.png"))
-                    if not client_steps:
-                        continue
-                    fig = plt.figure(figsize=(3 * len(client_steps), 3.6))
-                    for j, pth in enumerate(client_steps):
-                        ax = plt.subplot(1, len(client_steps), j + 1)
-                        ax.imshow(Image.open(pth))
-                        ax.set_title(pth.stem.replace("_", " "), fontsize=8)
-                        ax.axis("off")
-                    fig.tight_layout()
+                hist_dir = agg_dir / "history"
+                if hist_dir.exists():
+                    for client_id in range(args.num_clients):
+                        client_steps = sorted(
+                            list(hist_dir.glob(f"client_{client_id}_step_*.png"))
+                            + list(hist_dir.glob(f"client_{client_id}_iter_*.png"))
+                        )
+                        if not client_steps:
+                            continue
+                        fig = plt.figure(figsize=(3 * len(client_steps), 3.6))
+                        for j, pth in enumerate(client_steps):
+                            ax = plt.subplot(1, len(client_steps), j + 1)
+                            ax.imshow(Image.open(pth))
+                            ax.set_title(pth.stem.replace("_", " "), fontsize=8)
+                            ax.axis("off")
+                        fig.tight_layout()
 
         plt.show()
 
