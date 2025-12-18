@@ -448,6 +448,10 @@ def load_diffusion_prior(device: str, repo_id: str = "google/ddpm-cifar10-32", s
     scheduler = scheduler_cls.from_pretrained(repo_id)
     diffusion_model = UNet2DModel.from_pretrained(repo_id).to(device)
     diffusion_model.eval()
+    # We never update the diffusion prior; freezing avoids allocating grads for its parameters
+    # (while still allowing gradients to flow to its inputs in prior_mode='score').
+    for p in diffusion_model.parameters():
+        p.requires_grad_(False)
     return diffusion_model, scheduler
 
 
