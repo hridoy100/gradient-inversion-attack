@@ -30,6 +30,7 @@ python3 main.py --device cpu --reconstruct-mode aggregated --iterations 300 --re
 
 Key options:
 - `--device`: `auto` (default), `cpu`, or `cuda`.
+- `--cuda-stable`: stability mode for CUDA (disables TF32 + enables deterministic algorithms).
 - `--dataset`: `cifar100` (default) or `tiny-imagenet`.
 - `--dataset-split`: `train` (default) or `val` (Tiny-ImageNet).
 - `--image-size`: input size used for Tiny-ImageNet transforms (default `64`).

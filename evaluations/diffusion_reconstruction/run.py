@@ -452,6 +452,28 @@ def load_diffusion_prior(device: str, repo_id: str = "google/ddpm-cifar10-32", s
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Diffusion-based reconstruction from gradients.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device to run on. 'auto' picks CUDA if available.",
+    )
+    parser.add_argument(
+        "--no-tf32",
+        action="store_true",
+        help="Disable TF32 on CUDA matmul/cuDNN (often improves stability on some GPUs).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic CUDA/cuDNN algorithms (slower, but can improve reproducibility/stability).",
+    )
+    parser.add_argument(
+        "--cuda-stable",
+        action="store_true",
+        help="Convenience flag: equivalent to setting --no-tf32 and --deterministic.",
+    )
     parser.add_argument("--arch", type=str, default="lenet", choices=sorted(MODEL_BUILDERS.keys()))
     parser.add_argument("--pretrained", action="store_true", help="Use torchvision pretrained weights when available.")
     parser.add_argument(
@@ -575,7 +597,27 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested --device cuda but CUDA is not available.")
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    if device == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+        if args.cuda_stable:
+            args.no_tf32 = True
+            args.deterministic = True
+        if args.no_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        if args.deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True)
     print(f"Running diffusion-guided reconstruction on {device}")
 
     transform = default_transform(args.arch)

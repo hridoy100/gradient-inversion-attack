@@ -298,6 +298,21 @@ def parse_args():
         help="Device to run on. 'auto' picks CUDA if available.",
     )
     parser.add_argument(
+        "--no-tf32",
+        action="store_true",
+        help="Disable TF32 on CUDA matmul/cuDNN (often improves inversion stability on some GPUs).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic CUDA/cuDNN algorithms (slower, but can improve reproducibility/stability).",
+    )
+    parser.add_argument(
+        "--cuda-stable",
+        action="store_true",
+        help="Convenience flag: equivalent to setting --no-tf32 and --deterministic.",
+    )
+    parser.add_argument(
         "--dataset",
         type=str,
         default="cifar100",
@@ -769,6 +784,20 @@ def main():
         device = "cuda"
     else:
         device = "cpu"
+
+    if device == "cuda":
+        # Keep CUDA RNG aligned with CPU seed for more reproducible runs.
+        torch.cuda.manual_seed_all(args.seed)
+        if args.cuda_stable:
+            args.no_tf32 = True
+            args.deterministic = True
+        if args.no_tf32:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        if args.deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True)
     print(f"Running on {device}")
 
     dataset, num_classes, denormalize = build_dataset_and_transform(args)
