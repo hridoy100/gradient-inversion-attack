@@ -933,6 +933,7 @@ def main():
 
     if args.visualize:
         import matplotlib.pyplot as plt
+        from PIL import Image
 
         # Per-client figures.
         if args.reconstruct_mode in ("per-client", "both"):
