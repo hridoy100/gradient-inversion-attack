@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+import textwrap
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -171,6 +172,10 @@ def align_reconstruction_to_original(
             if "data" in entry and isinstance(entry["data"], torch.Tensor) and entry["data"].dim() == 4:
                 entry["data"] = entry["data"].index_select(0, perm_t.to(entry["data"].device))
     return reconstructed, recovered_labels, history
+
+
+def _wrap_title(title: str, width: int = 22) -> str:
+    return "\n".join(textwrap.fill(line, width=width) for line in title.splitlines())
 
 
 def parse_args():
@@ -354,7 +359,7 @@ def visualize_per_client_recovery(per_client_results, samples_per_client: int, d
                 ax = axes[0][i]
                 ax.imshow(to_safe_grid_pil(entry["data"], denormalize, max_cols=grid_cols))
                 ax.set_title(
-                    f"C{client.client_id} Iter {entry['iteration']}\nGradLoss {entry['loss']:.2f}",
+                    _wrap_title(f"C{client.client_id} Iter {entry['iteration']}\nGradLoss {entry['loss']:.2f}"),
                     fontsize=8,
                     pad=4,
                 )
@@ -420,8 +425,10 @@ def visualize_aggregated_recovery(
                     ).item()
                 )
                 ax.set_title(
-                    f"Agg C{client_id} Iter {entry['iteration']}\nGradLoss {entry['loss']:.2f}  MSE {mse:.4f}",
-                    fontsize=8,
+                    _wrap_title(
+                        f"Agg C{client_id} Iter {entry['iteration']}\nGradLoss {entry['loss']:.2f}\nMSE {mse:.4f}"
+                    ),
+                    fontsize=7,
                     pad=4,
                 )
                 ax.title.set_wrap(True)
